@@ -1,0 +1,673 @@
+事务状态机设计书
+1. 文档目的
+
+本设计书用于在既有服务层边界定义、服务层内部契约设计与规则层契约设计基础上，正式定义后端 Borrow/Return 两条 V1 主链路的事务状态机模型，统一状态集合、事件集合、迁移条件、超时控制、重复事件处理、失败收口规则与持久化触发时机，为后续服务层重构、事务控制层拆分与正式编码实现提供唯一依据。
+
+本设计严格遵循现有项目背景：
+
+后端总体结构已明确将事务状态控制层单独划为核心层，负责 PendingTransaction、状态机、超时控制与结果控制。
+服务层负责流程编排、规则校验调用、待确认事务创建与推进、硬件确认请求发起、硬件确认结果后的数据库提交触发，不负责串口协议封包拆包、CRC、重传、心跳处理与底层串口连接管理。
+通信协议已正式定义 ACK、重传、心跳、SeqID 去重、事务处理状态机与异常处理闭环。
+当前代码已具备 PendingTransaction、TransactionState、BusinessResult、OperationRecordInput、request_seq + request_id + asset_id + action_type 关联规则与 Borrow/Return V1 实现。
+2. 适用范围
+
+本设计书正式适用于当前 V1 版本的以下事务范围：
+
+借出确认事务
+归还确认事务
+ACK 等待阶段
+硬件结果等待阶段
+数据库更新阶段
+成功与失败终态收口阶段
+
+本阶段不正式纳入以下范围：
+
+入库事务状态机
+预约事务状态机
+续借事务状态机
+验收事务状态机
+盘点事务状态机
+多设备并发调度状态机
+WebSocket 推送协议状态机
+
+上述限制符合当前 V1 范围：服务层内部契约与规则层契约均已明确，当前正式范围仅覆盖 Borrow/Return 两条主链路。
+
+3. 状态机定位
+
+事务状态机在后端结构中的定位为：
+
+面向待确认事务的运行时控制机制。
+
+其职责是在一笔 Borrow/Return 请求通过规则校验后，对该事务从“发起请求”到“硬件确认”再到“数据库提交或失败终止”的全过程进行显式状态管理，确保：
+
+每笔事务都处于唯一明确状态
+每次事件都只能在合法状态下生效
+所有失败路径均有确定收口
+所有成功路径均能与数据库落库严格对应
+
+该定位与后端总体架构中“事务状态控制层”的定义完全一致。
+
+4. 设计原则
+4.1 显式状态原则
+
+事务运行过程不得依赖隐式布尔变量或散落的条件判断来描述阶段，必须以统一枚举状态表示当前事务所处阶段。当前服务层内部契约已正式定义 TransactionState。
+
+4.2 单向迁移原则
+
+事务状态迁移必须遵循明确的单向链路，不允许在未经定义的情况下跨状态跳转或逆向跳转。
+
+4.3 事件驱动原则
+
+状态变化必须由明确事件触发，不允许由“时间经过了”或“调用了某函数”这种模糊语义直接改状态。协议已定义 ACK、EVT_USER_ACTION、HEARTBEAT、超时、重传等事件来源。
+
+4.4 成功提交后终态原则
+
+只有在 OperationRecordInput 成功完成原子提交后，事务才允许进入成功终态。服务层内部契约已明确：仅 UPDATING 阶段允许触发 Repository 原子提交。
+
+4.5 非法事件丢弃原则
+
+对于孤儿事件、迟到事件、重复事件、字段不匹配事件，状态机不得推进状态，应直接忽略并记录日志。当前代码已按此方向实现 EVT_USER_ACTION 的严格过滤。
+
+4.6 协议一致原则
+
+状态机设计必须严格兼容现有协议：
+
+ACK 匹配以 SeqID 严格一致为准
+非 ACK 消息收到后需回复 ACK
+ACK 超时阈值与最大重传次数由串口层保证
+设备离线通过心跳/数据空闲超时检测得到。
+5. 状态集合设计
+
+当前正式状态集合沿用既有 TransactionState 定义：
+
+IDLE
+WAIT_ACK
+WAIT_HW
+UPDATING
+COMPLETED
+FAILED
+5.1 IDLE
+语义
+
+事务对象尚未进入实际等待流程的初始概念态。
+
+约束
+不参与运行时等待
+不允许直接持有需要响应的硬件事件
+当前 V1 中，业务事务在创建后直接进入 WAIT_ACK，因此 IDLE 主要保留为枚举完整性与后续扩展预留态。
+5.2 WAIT_ACK
+语义
+
+服务层已构建请求并调用串口层发送请求，当前等待链路层 ACK。
+
+进入条件
+规则层放行
+已生成 request_id
+已预留 request_seq
+已创建 PendingTransaction
+已调用 SerialManager.send_request() 发送 CMD_REQ_CONFIRM。
+允许事件
+ACK_OK
+ACK_BUSY
+ACK_ERROR
+ACK_INVALID
+ACK_TIMEOUT
+设备离线状态变更
+不允许动作
+不允许写业务数据库
+不允许根据用户动作事件直接提交
+5.3 WAIT_HW
+语义
+
+链路层已确认硬件收到请求，当前等待用户物理按键对应的业务结果事件。
+
+进入条件
+WAIT_ACK 状态下收到 ACK_OK。
+允许事件
+合法匹配的 EVT_USER_ACTION
+HW_RESULT_TIMEOUT
+设备离线状态变更
+重复或迟到的 EVT_USER_ACTION（仅允许忽略，不允许推进）
+不允许动作
+不允许提前写业务数据库
+不允许因孤儿事件推进状态
+5.4 UPDATING
+语义
+
+硬件业务确认结果已匹配成功，当前正执行数据库原子提交。
+
+进入条件
+WAIT_HW 状态下收到合法且匹配成功的 EVT_USER_ACTION
+confirm_result == CONFIRMED
+hw_seq 已存在。
+允许动作
+构建 OperationRecordInput
+调用 apply_operation_atomically()
+捕获提交异常并回滚
+不允许动作
+不允许再次接收新的业务事件并推进当前事务
+不允许重新发送硬件请求
+5.5 COMPLETED
+语义
+
+事务成功完成，资产状态更新与流水记录已原子落库。
+
+进入条件
+UPDATING 状态下原子提交成功
+结果对象构建成功。
+约束
+终态
+不允许再推进
+应从待确认事务池中清理
+5.6 FAILED
+语义
+
+事务因任一失败原因终止，未形成成功业务闭环。
+
+进入条件
+
+包括但不限于：
+
+规则层拒绝
+ACK 失败
+ACK 超时
+硬件结果超时
+用户取消
+用户超时
+设备忙
+设备离线
+资产不存在
+状态非法
+提交失败
+关键关联字段不满足要求。
+约束
+终态
+不允许再推进
+应从待确认事务池中清理
+6. 事件集合设计
+
+事务状态机的正式事件集合定义如下。
+
+6.1 规则放行事件 RULE_PASSED
+
+表示规则层完成裁决并允许继续。
+
+6.2 规则拒绝事件 RULE_REJECTED
+
+表示规则层拒绝当前请求，事务不得创建。该事件在严格意义上发生在事务创建前，因此不会推进 PendingTransaction 状态，但属于事务状态机入口外侧的前置门禁事件。
+
+6.3 ACK 成功事件 ACK_OK
+
+由串口层 SendResult.success == True 且 ack_type == ACK_OK 表示。
+
+6.4 ACK 失败事件
+
+包括：
+
+ACK_BUSY
+ACK_ERROR
+ACK_INVALID
+ACK_TIMEOUT
+
+协议已明确定义 ACK 类型与 ACK 超时重传策略。
+
+6.5 硬件业务结果事件 HW_RESULT_RECEIVED
+
+表示收到合法匹配的 EVT_USER_ACTION，且事件已通过：
+
+asset_id 校验
+request_seq 校验
+action_type 校验
+request_id 校验
+重复事件过滤。
+6.6 硬件结果超时事件 HW_RESULT_TIMEOUT
+
+表示已收到 ACK，但在业务等待窗口内未收到合法匹配的 EVT_USER_ACTION。当前 V1 代码使用 timeout_ms / 1000 + 5 作为等待窗口。
+
+6.7 设备离线事件 DEVICE_OFFLINE
+
+来源于串口层状态检测：
+
+MCU 心跳 5 秒一次
+PC 连续 15 秒未收到心跳或业务数据判定离线。
+6.8 提交成功事件 COMMIT_SUCCESS
+
+表示 apply_operation_atomically() 成功完成。
+
+6.9 提交失败事件 COMMIT_FAILED
+
+表示原子提交过程中出现：
+
+资产不存在
+状态非法
+仓储异常
+回滚触发。
+6.10 非法/重复/孤儿事件 IGNORED_EVENT
+
+包括：
+
+缺少关键字段的 EVT_USER_ACTION
+request_seq 非法
+action_type 非法
+找不到待确认事务
+重复事件
+不匹配事件。
+
+该类事件不得推进状态。
+
+7. 状态迁移总表
+7.1 主成功链路
+
+RULE_PASSED
+→ 创建事务
+→ WAIT_ACK
+→ ACK_OK
+→ WAIT_HW
+→ HW_RESULT_RECEIVED(confirm_result = CONFIRMED)
+→ UPDATING
+→ COMMIT_SUCCESS
+→ COMPLETED
+
+该链路与协议定义、服务层内部契约及现有实现完全一致。
+
+7.2 ACK 失败链路
+
+WAIT_ACK
+→ ACK_BUSY / ACK_ERROR / ACK_INVALID / ACK_TIMEOUT
+→ FAILED
+
+7.3 硬件失败链路
+
+WAIT_HW
+→ HW_RESULT_RECEIVED(confirm_result = CANCELLED / TIMEOUT / BUSY / unknown)
+→ FAILED
+
+7.4 硬件结果等待超时链路
+
+WAIT_HW
+→ HW_RESULT_TIMEOUT
+→ FAILED
+
+7.5 持久化失败链路
+
+WAIT_HW
+→ HW_RESULT_RECEIVED(confirm_result = CONFIRMED)
+→ UPDATING
+→ COMMIT_FAILED
+→ FAILED
+
+7.6 非法事件链路
+
+WAIT_HW 或终态
+→ IGNORED_EVENT
+→ 原状态保持不变
+
+8. 各状态详细迁移规则
+8.1 从 IDLE 出发
+合法迁移
+IDLE -> WAIT_ACK
+触发条件
+已完成规则层校验
+服务层已决定正式发起事务
+说明
+
+当前 V1 中，PendingTransaction 创建时直接赋值为 WAIT_ACK，因此 IDLE 不作为实际运行态停留。
+
+8.2 WAIT_ACK 状态迁移规则
+8.2.1 WAIT_ACK -> WAIT_HW
+触发事件
+
+ACK_OK
+
+触发条件
+send_request() 成功
+ack_type == ACK_OK。
+动作
+更新事务状态为 WAIT_HW
+开启硬件结果等待窗口
+8.2.2 WAIT_ACK -> FAILED
+触发事件
+ACK_BUSY
+ACK_ERROR
+ACK_INVALID
+ACK_TIMEOUT
+动作
+设置状态为 FAILED
+输出标准 BusinessResult
+不写数据库
+从事务池清理。
+8.2.3 WAIT_ACK 状态下收到 EVT_USER_ACTION
+处理原则
+视为非法时序事件
+不推进状态
+记录日志并忽略
+理由
+
+在协议语义上，只有链路层 ACK 成功后，业务层才进入等待用户动作阶段。
+
+8.3 WAIT_HW 状态迁移规则
+8.3.1 WAIT_HW -> UPDATING
+触发事件
+
+HW_RESULT_RECEIVED
+
+附加条件
+confirm_result == CONFIRMED
+hw_seq 已存在
+事件与待确认事务匹配成功。
+动作
+填充 PendingTransaction.hw_seq / hw_result / hw_sn
+标记 response_received = True
+状态改为 UPDATING
+8.3.2 WAIT_HW -> FAILED
+触发事件
+
+硬件结果非确认成功，包括：
+
+CANCELLED
+TIMEOUT
+BUSY
+未知结果码
+动作
+状态改为 FAILED
+输出标准失败结果
+不写数据库
+从事务池清理。
+8.3.3 WAIT_HW -> FAILED
+触发事件
+
+HW_RESULT_TIMEOUT
+
+动作
+状态改为 FAILED
+错误消息写入 error_message
+输出 HW_RESULT_TIMEOUT
+从事务池清理。
+8.3.4 WAIT_HW 状态下收到重复事件
+识别条件
+response_received == True
+或等待事件已置位
+或 request_seq / action_type / request_id 不匹配。
+处理原则
+不推进状态
+忽略事件
+记录日志
+8.3.5 WAIT_HW 状态下设备离线
+当前 V1 处理现状
+
+当前实现仅记录设备离线状态，并未对正在 WAIT_HW 的事务做主动批量失败收口。
+
+本设计正式约束
+
+在 V1 正式状态机中，设备离线事件对 WAIT_HW 事务的影响定义为：
+
+不立即强制失败
+保持等待，直至 HW_RESULT_TIMEOUT 到达后失败收口
+采用该约束的理由
+当前实现已经以“等待窗口 + 超时收口”为主闭环；
+协议规定的离线检测是全局链路状态，不必然意味着该事务永远不可能收到迟到结果；
+该处理方式与现有 V1 代码保持一致，避免在第四步引入与现状冲突的新行为。
+8.4 UPDATING 状态迁移规则
+8.4.1 UPDATING -> COMPLETED
+触发事件
+
+COMMIT_SUCCESS
+
+条件
+OperationRecordInput 构建成功
+apply_operation_atomically() 成功返回新资产状态。
+动作
+状态置为 COMPLETED
+返回成功 BusinessResult
+从事务池清理
+8.4.2 UPDATING -> FAILED
+触发事件
+
+COMMIT_FAILED
+
+失败类型
+LookupError
+ValueError
+其他仓储异常。
+动作
+调用回滚
+状态置为 FAILED
+返回失败 BusinessResult
+从事务池清理
+8.4.3 UPDATING 状态下再次收到业务事件
+处理原则
+不推进状态
+直接忽略
+理由
+
+该阶段事务已脱离硬件等待阶段，转入持久化边界，不允许再受新业务事件干扰。
+
+8.5 COMPLETED 与 FAILED 终态规则
+8.5.1 终态不可再迁移
+
+COMPLETED 与 FAILED 为正式终态。服务层内部契约已明确该要求。
+
+8.5.2 终态收到任何业务事件
+处理原则
+不推进状态
+记录日志
+直接忽略
+8.5.3 终态资源清理要求
+必须从待确认事务池中移除
+不应再保留事件等待对象
+不应再允许后续提交或重试沿用同一事务上下文
+
+当前 V1 代码已在 _request_action() finally 中清理 _pending_by_asset[asset_id]。
+
+9. 超时控制设计
+9.1 ACK 超时 ACK_TIMEOUT
+定义
+
+服务层请求下发后，在 ACK 等待窗口内未收到合法 ACK。
+
+协议依据
+ACK 需在 300ms 内回复
+PC 端 ACK 超时阈值为 500ms
+最大重传次数为 3 次。
+责任归属
+
+ACK 超时检测由串口层 SerialManager.send_request() 完成。
+
+状态机语义
+在事务层视为 WAIT_ACK -> FAILED
+失败码为 ACK_TIMEOUT
+9.2 硬件结果超时 HW_RESULT_TIMEOUT
+定义
+
+ACK 已收到，但业务等待窗口内未收到合法匹配的 EVT_USER_ACTION。
+
+当前 V1 实现
+
+等待时间 = timeout_ms / 1000 + 5。
+
+状态机语义
+在事务层视为 WAIT_HW -> FAILED
+失败码为 HW_RESULT_TIMEOUT
+9.3 两类超时必须分离
+
+本设计正式规定：
+
+ACK_TIMEOUT 与 HW_RESULT_TIMEOUT 必须作为两类不同失败事件处理
+不得混为单一 timeout
+
+理由如下：
+
+两者处于不同事务阶段；
+两者对应的协议含义不同；
+两者对排障与日志定位的价值不同。
+10. 重复事件、孤儿事件与不匹配事件处理设计
+10.1 重复事件
+类型
+重复 ACK
+重复 EVT_USER_ACTION
+协议依据
+
+接收端缓存最近 5 个已处理 SeqID，重复收到仅回复 ACK，不触发业务。
+
+状态机处理原则
+不推进事务状态
+若为传输层重复帧，由串口层 ACK 后忽略
+若为业务层重复 EVT_USER_ACTION，由服务层直接忽略。
+10.2 孤儿事件
+定义
+
+收到事件时找不到对应 asset_id 的待确认事务。
+
+状态机处理原则
+不创建新事务
+不推进状态
+记录日志后忽略。
+10.3 不匹配事件
+定义
+
+存在待确认事务，但以下任一字段不一致：
+
+request_seq
+action_type
+request_id
+状态机处理原则
+不推进状态
+不覆盖当前事务数据
+记录日志后忽略。
+11. 状态机与服务层、规则层、串口层、仓储层的边界关系
+11.1 与规则层的关系
+
+规则层位于状态机之前。规则层不推进事务状态，不创建 PendingTransaction，只负责裁决请求能否进入事务状态机。规则层设计书已正式明确该边界。
+
+11.2 与服务层的关系
+
+服务层是状态机的宿主编排层：
+
+创建事务
+调用规则层
+调用串口层
+等待事件
+触发仓储提交
+构建最终 BusinessResult。
+11.3 与串口层的关系
+
+串口层负责：
+
+协议封包/解包
+ACK 等待与重传
+去重
+心跳检测
+事件上抛。
+
+状态机不直接处理串口字节流，只消费：
+
+SendResult
+Frame(EVT_USER_ACTION)
+DeviceStatus 变化
+11.4 与仓储层的关系
+
+仓储层不推进事务状态，仅在 UPDATING 阶段被调用，负责：
+
+再次校验资产状态
+原子提交资产状态与流水
+必要时回滚。
+12. 与当前代码实现的映射关系
+
+当前 service.py 已形成一版 V1 状态机雏形，其对应关系如下：
+
+12.1 事务创建后进入 WAIT_ACK
+
+PendingTransaction 创建时 state = WAIT_ACK。
+
+12.2 ACK_OK 后进入 WAIT_HW
+
+send_request() 成功后状态改为 WAIT_HW。
+
+12.3 合法硬件结果进入 UPDATING
+
+_on_frame() 匹配合法 EVT_USER_ACTION 后写入 hw_seq / hw_result / hw_sn，随后 _finalize_transaction() 根据结果决定是否提交。
+
+12.4 原子提交成功进入 COMPLETED
+
+apply_operation_atomically() 成功后设置 tx.state = COMPLETED。
+
+12.5 任一失败进入 FAILED
+
+当前 ACK 失败、硬件结果超时、取消、状态非法、提交异常等路径，均设置为 FAILED。
+
+因此，第四步设计的本质不是推翻现有 V1，而是：
+
+将现有 service.py 中已经存在的事务推进逻辑正式抽象为独立的事务状态机契约。
+
+13. 推荐实现形态
+13.1 推荐组件名称
+
+TransactionManager
+
+13.2 推荐核心职责
+创建事务上下文
+保存 PendingTransaction
+执行状态迁移
+统一处理合法/非法事件
+管理超时收口
+向服务层返回标准迁移结果
+13.3 推荐方法清单
+create_transaction(...)
+mark_ack_success(...)
+mark_ack_failure(...)
+handle_hw_event(...)
+mark_hw_timeout(...)
+begin_commit(...)
+mark_commit_success(...)
+mark_commit_failed(...)
+remove_transaction(...)
+13.4 推荐数据结构
+request_seq -> TransactionContext
+asset_id -> request_seq
+
+当前 V1 仅按 asset_id -> TransactionContext 管理事务。
+为严格遵循当前背景，本设计书不强制在 V1 立即重构为双索引，但正式建议在进入第五步编码设计时预留双索引方向，以提升事件定位效率并降低未来多事务扩展的重构成本。
+
+14. 第四步成熟判定标准
+
+第四步“事务状态机设计”成熟的判定标准如下：
+
+14.1 状态集合成熟
+WAIT_ACK / WAIT_HW / UPDATING / COMPLETED / FAILED 已正式定义
+每个状态的语义唯一、边界清晰。
+14.2 事件集合成熟
+ACK 成功/失败
+硬件结果成功/失败
+两类超时
+提交成功/失败
+重复/孤儿/不匹配事件
+均已正式收口。
+14.3 迁移规则成熟
+成功链路闭合
+失败链路闭合
+非法事件不推进状态
+终态不可再迁移
+14.4 分层边界成熟
+规则层、服务层、串口层、仓储层与状态机之间的责任边界无交叉
+状态机不承担协议封包、数据库 SQL 或页面逻辑。
+14.5 可实现成熟
+可直接指导将 service.py 拆分为事务管理组件
+不需要再返工第二步对象契约与第三步规则契约。
+14.6 可测试成熟
+
+至少可直接写出以下测试：
+
+ACK_OK 后应进入 WAIT_HW
+ACK_TIMEOUT 应进入 FAILED
+CONFIRMED 后应进入 UPDATING
+CANCELLED / TIMEOUT 应进入 FAILED
+HW_RESULT_TIMEOUT 应进入 FAILED
+提交成功应进入 COMPLETED
+提交失败应进入 FAILED
+重复事件不应推进状态
+孤儿事件不应推进状态
+15. 正式结论
+
+本设计书将第四步正式定义为：
+
+在既有服务层边界、服务层内部契约与规则层契约不变的前提下，将 Borrow/Return 两条 V1 主链路中的运行时事务控制正式抽象为以 PendingTransaction 为核心的事务状态机，并以 WAIT_ACK -> WAIT_HW -> UPDATING -> COMPLETED/FAILED 作为正式状态主链，以 ACK 结果、硬件业务结果、超时事件与提交结果作为正式驱动事件，统一收口成功链路、失败链路、重复事件、孤儿事件与不匹配事件的处理规则，确保“规则放行—硬件确认—数据库提交—结果收口”全过程具备可解释、可测试、可拆分实现的运行时控制基础。

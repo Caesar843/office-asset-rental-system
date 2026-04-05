@@ -1,0 +1,528 @@
+服务层内部契约与核心对象设计书
+1. 文档目的
+
+本设计书用于统一后端服务层内部的数据契约、核心对象、字段命名、状态语义与关联规则，为后续服务层编码、状态机实现、仓储提交、接口对接与联调测试提供唯一依据。
+
+本设计严格建立在现有项目背景之上：服务层负责业务编排，不负责串口协议封包拆包、CRC 校验、重传、心跳处理与底层串口连接管理；服务层上游为 API 层与扫码识别模块，下游为事务状态管理器、硬件网关与 Repository。
+系统整体架构已明确：后端应用服务层负责借出、归还、入库等流程编排，事务状态控制层负责 PendingTransaction 与状态机推进，硬件网关适配层负责接收 ACK、EVT_USER_ACTION、EVT_HEARTBEAT 并转化为后端可消费事件。
+
+2. 适用范围
+
+本设计书适用于当前 V1 版本的借出与归还核心闭环，不将入库流程视为本阶段已正式落地的契约范围。原因如下：
+
+第一，当前代码模型中的 ActionType 仅定义了 BORROW 与 RETURN 两种动作类型。
+第二，当前服务层实现仅提供借出确认与归还确认两类服务入口。
+因此，本阶段服务层内部契约的正式范围定义为：
+
+借出确认链路 + 归还确认链路
+
+入库流程仅作为后续扩展预留，不纳入本设计书的正式对象清单与强制约束。
+
+3. 设计原则
+3.1 单一事实源原则
+
+同一业务语义在系统内只能存在一套主字段命名，不允许出现多套同义字段并行使用。服务层内部必须统一采用如下核心命名：
+
+asset_id：资产标识
+user_id：操作者标识
+action_type：动作类型
+request_seq：服务层业务事务号
+request_id：服务层辅助随机请求标识
+hw_seq：硬件事件序号
+hw_result：硬件确认结果
+
+不得额外引入与之等价但命名不同的字段，如 biz_seq、tx_id、confirm_seq、asset_code 等。
+
+3.2 分层解耦原则
+
+服务层只接收抽象业务对象，不直接消费串口字节流，不直接处理协议帧，不直接管理 ACK 重传与心跳检测，不直接拼接底层 SQL。该分层边界已在服务层边界定义与系统总架构中明确。
+
+3.3 全链路可追溯原则
+
+任何成功或失败的关键业务事务，必须可以从服务层追溯到数据库流水记录与硬件确认记录。数据库模型已明确 operation_records 需保存 asset_id、user_id、op_type、op_time、hw_seq、hw_result、due_time 等关键字段，用于事后核对与复盘。
+赛题要求亦明确关键流程记录应能关联硬件确认记录，保证流程可追溯、可核对。
+
+3.4 双重关联校验原则
+
+服务层不得仅凭 asset_id 匹配硬件回调事件。当前代码实现已采用 request_seq + request_id + asset_id + action_type 的联合校验策略对 EVT_USER_ACTION 进行匹配与过滤，该策略应被正式固化为服务层契约规则。
+
+4. 枚举契约设计
+
+服务层内部所有对象均依赖统一枚举，不允许在不同模块中重复定义或使用自由字符串代替。
+
+4.1 动作类型 ActionType
+
+当前正式动作类型固定为：
+
+BORROW
+RETURN
+
+协议侧示例 payload 已明确使用 action_type 字段传输动作语义，服务层与 MCU 上报结果中必须保持一致。
+
+4.2 事务状态 TransactionState
+
+当前正式事务状态固定为：
+
+IDLE
+WAIT_ACK
+WAIT_HW
+UPDATING
+COMPLETED
+FAILED
+
+协议与架构文档已经定义事务处理状态机至少包含“发送请求后等待 ACK”“收到 ACK 后等待用户物理按键”“收到硬件结果后更新数据库”等阶段。
+考虑到当前代码已将最终成功态定义为 COMPLETED，本设计书统一采用 COMPLETED，不再混用 DONE。
+
+4.3 结果码 ConfirmResult
+
+当前正式结果码体系固定为：
+
+CONFIRMED
+CANCELLED
+TIMEOUT
+BUSY
+ACK_ERROR
+ACK_INVALID
+ACK_TIMEOUT
+HW_RESULT_TIMEOUT
+DEVICE_OFFLINE
+ASSET_NOT_FOUND
+STATE_INVALID
+INTERNAL_ERROR
+
+该结果码体系同时覆盖三类语义：
+其一，硬件动作结果，如 CONFIRMED / CANCELLED / TIMEOUT；
+其二，链路层异常，如 ACK_TIMEOUT / ACK_ERROR / ACK_INVALID / BUSY；
+其三，服务层业务异常，如 ASSET_NOT_FOUND / STATE_INVALID / INTERNAL_ERROR。
+
+4.4 资产状态 AssetStatus
+
+当前正式资产状态固定为：
+
+IN_STOCK
+BORROWED
+MAINTENANCE
+SCRAPPED
+
+该定义与数据库中的资产状态语义完全一致，数据库表 assets.status 记录在库、借出、维修、报废四种状态。
+协议文档中的资产生命周期定义也与此一致。
+
+4.5 设备状态 DeviceStatus
+
+当前正式设备状态固定为：
+
+UNKNOWN
+ONLINE
+OFFLINE
+
+该状态由串口层维护，并通过状态回调上抛至服务层。
+
+5. 服务层命令对象设计
+
+命令对象用于表达 API 层进入服务层的正式业务请求。命令对象必须作为服务层入口参数的逻辑标准，禁止长期依赖裸参数列表或无约束字典。
+
+5.1 借出命令对象 BorrowCommand
+定义目的
+
+表示一笔借出确认业务请求。
+
+必备字段
+asset_id: str
+user_id: str
+user_name: str
+timeout_ms: int = 30000
+设计依据
+
+当前借出服务入口要求资产 ID、用户 ID、用户姓名和超时毫秒数。CLI 与测试代码也按该结构组织参数。
+
+约束规则
+asset_id 不得为空
+user_id 不得为空
+user_name 不得为空
+timeout_ms 必须为正整数
+timeout_ms 必须映射为发送给 MCU 的 wait_timeout 字段
+5.2 归还命令对象 ReturnCommand
+定义目的
+
+表示一笔归还确认业务请求。
+
+必备字段
+asset_id: str
+user_id: str
+user_name: str
+timeout_ms: int = 30000
+约束规则
+约束与借出命令对象一致
+动作类型固定解释为 RETURN
+6. 待确认事务对象设计
+
+待确认事务对象是服务层内部的核心对象，用于承载一笔尚未完成硬件确认与数据库提交的业务事务。
+
+6.1 对象名称
+
+PendingTransaction
+
+6.2 已有实现字段
+
+当前代码中 PendingTransaction 已包含如下字段：
+
+asset_id
+user_id
+user_name
+action_type
+request_id
+request_seq
+state
+hw_seq
+hw_result
+hw_sn
+response_received
+error_message
+
+该结构符合服务层当前需求，应作为正式契约保留。
+
+6.3 字段语义
+业务关联字段
+asset_id：资产唯一标识
+user_id：操作者唯一标识
+user_name：操作者展示名称
+action_type：事务动作，取值仅允许 BORROW / RETURN
+事务关联字段
+request_id：服务层生成的随机请求标识，当前通过 uuid.uuid4().hex 生成，用于提升事件匹配的抗串单能力。
+request_seq：服务层主事务序号，也是串口请求的主关联号。当前由 SerialManager.reserve_seq_id() 预留并作为发送帧的 seq_id 使用。
+状态字段
+state：事务当前状态
+response_received：是否已经接收并确认匹配到合法的硬件结果事件
+硬件回填字段
+hw_seq：匹配成功的硬件事件序号
+hw_result：硬件返回的确认结果
+hw_sn：硬件设备序列标识
+错误字段
+error_message：失败收口时的补充错误说明
+6.4 状态迁移规则
+
+一笔待确认事务的合法迁移链如下：
+
+创建后进入 WAIT_ACK
+收到 ACK_OK 后进入 WAIT_HW
+收到合法且匹配成功的 EVT_USER_ACTION，并准备提交数据库时进入 UPDATING
+原子提交成功后进入 COMPLETED
+任意失败路径进入 FAILED
+6.5 状态迁移约束
+WAIT_ACK 阶段不得改写业务数据库
+WAIT_HW 阶段不得改写业务数据库
+仅 UPDATING 阶段允许触发 Repository 原子提交
+COMPLETED 与 FAILED 均为终态
+成功进入终态后必须清理待确认事务池中的对应记录
+6.6 并发约束
+
+当前服务实现采用 asset_id -> TransactionContext 的方式管理待确认事务，因此当前正式约束为：
+
+同一资产同一时刻只允许存在一笔待确认事务。
+
+该约束适用于当前赛题场景与现有代码组织方式。
+
+7. 硬件事件契约设计
+
+服务层不直接消费串口字节流，但必须消费由串口层抽象后的硬件事件。协议侧目前存在三类核心消息：
+
+ACK 类消息
+EVT_USER_ACTION
+EVT_HEARTBEAT
+
+因此服务层正式事件契约分为三类。
+
+7.1 链路确认结果对象 HardwareAckResult
+定义目的
+
+表示一次服务层请求在链路层是否成功收到 ACK，以及 ACK 的具体类型和说明。
+
+字段
+request_seq: int
+ack_type
+success: bool
+detail: str | None
+ack_payload: dict | None
+设计依据
+
+当前串口层的 SendResult 已实际承载该语义，包括 success、seq_id、ack_type、message、ack_payload。
+因此在实现层面，SendResult 可直接视为 HardwareAckResult 的既有实现。
+
+7.2 用户动作事件对象 HardwareUserActionEvent
+定义目的
+
+表示 MCU 在用户物理确认、取消或超时后，上报给服务层的一次业务确认结果。
+
+必备字段
+hw_seq: int
+asset_id: str
+request_seq: int
+request_id: str | None
+action_type: ActionType
+confirm_result: str
+hw_sn: str | None
+设计依据
+
+当前 mock MCU 在 EVT_USER_ACTION 中已回传 asset_id、request_seq、request_id、action_type、confirm_result、hw_sn；其中帧头自身的 seq_id 即该事件的 hw_seq。
+
+匹配规则
+
+服务层接收该事件后，必须按如下顺序进行合法性校验：
+
+asset_id 必须存在且匹配当前待确认事务
+request_seq 必须存在且匹配当前待确认事务
+action_type 必须存在且匹配当前待确认事务
+若当前待确认事务中存在 request_id，则事件中必须带回 request_id
+事件中的 request_id 必须与事务中的 request_id 完全一致
+若事务已收到响应或事件已置位完成，则视为重复事件并直接丢弃
+
+上述规则必须固化为服务层内部契约，不得仅作为临时代码逻辑存在。
+
+7.3 心跳事件对象 HardwareHeartbeatEvent
+定义目的
+
+表示硬件设备的存活状态与基础运行状态。
+
+字段
+hw_seq: int
+hw_sn: str | None
+status: str | None
+timestamp: int
+设计依据
+
+协议已定义 EVT_HEARTBEAT 由 MCU 每 5 秒发送一次，用于在线检测。PC 连续 15 秒未收到心跳或业务数据则判定离线。
+当前串口管理器已经内建设备在线检测与状态变更回调机制。
+
+服务层处理原则
+
+服务层不参与心跳帧解析，仅消费设备状态变更结果，即 UNKNOWN / ONLINE / OFFLINE。
+
+8. 数据库提交对象设计
+
+数据库提交对象是服务层向 Repository 发起原子落库时唯一允许使用的正式入参对象。
+
+8.1 对象名称
+
+OperationRecordInput
+
+8.2 已有实现字段
+
+当前代码中 OperationRecordInput 包含：
+
+asset_id
+user_id
+user_name
+action_type
+request_seq
+request_id
+hw_seq
+hw_result
+hw_sn
+due_time
+8.3 字段语义
+必填字段
+asset_id
+user_id
+user_name
+action_type
+request_seq
+hw_seq
+hw_result
+可空字段
+request_id
+hw_sn
+due_time
+8.4 提交约束
+hw_seq 为空时不得提交数据库，服务层必须直接失败收口。当前 _finalize_transaction() 已按该规则实现。
+hw_result 必须来源于已成功匹配到的 EVT_USER_ACTION.confirm_result
+request_seq 必须来源于当前待确认事务
+action_type 必须与待确认事务一致
+due_time 在当前 V1 阶段可允许为空；数据库模型保留该字段，作为后续借期规则扩展入口。
+8.5 与数据库模型的映射关系
+
+数据库模型要求业务流水表 operation_records 能将资产、用户与硬件确认三者绑定，特别要求记录 hw_seq 与 hw_result。
+因此 OperationRecordInput 必须被视为服务层到持久化层的唯一正式桥接对象。
+
+9. 统一业务结果对象设计
+
+服务层对 API 层、CLI 演示程序、测试脚本以及未来 WebSocket 通知层返回结果时，必须采用统一业务结果对象。
+
+9.1 对象名称
+
+BusinessResult
+
+9.2 已有实现字段
+
+当前代码中 BusinessResult 包含：
+
+success
+code
+message
+asset_id
+action_type
+user_id
+user_name
+seq_id
+request_seq
+request_id
+hw_seq
+hw_result
+hw_sn
+device_status
+transaction_state
+extra
+
+该对象结构完整，适合作为正式统一出参。
+
+9.3 字段语义
+结果主字段
+success：事务是否成功闭环完成
+code：机器可判定的标准结果码
+message：面向前端、日志或演示输出的人类可读信息
+业务上下文字段
+asset_id
+action_type
+user_id
+user_name
+事务追踪字段
+seq_id
+request_seq
+request_id
+
+当前实现中，服务层主动发起事务时 seq_id 与 request_seq 为同值，因为发送请求时显式使用 seq_id=request_seq。
+但从语义上看，seq_id 仍偏向传输层帧序号，request_seq 仍偏向业务事务号，因此两者不得在设计层面混并成单字段。
+
+硬件追溯字段
+hw_seq
+hw_result
+hw_sn
+运行态字段
+device_status
+transaction_state
+扩展字段
+extra
+
+extra 用于承载附加信息，例如当前资产状态等，不得用于替代正式字段。
+
+10. 关键字段贯穿规则
+
+为避免后续实现中字段语义混乱，以下字段的来源、作用范围与约束必须正式固定。
+
+10.1 request_seq
+定义
+
+服务层主事务号。
+
+生成方式
+
+由串口层 reserve_seq_id() 预留生成，并在发送请求时作为帧 seq_id 一并下发。
+
+贯穿范围
+待确认事务对象 PendingTransaction
+串口发送 payload
+ACK 匹配
+EVT_USER_ACTION 匹配
+数据库提交对象 OperationRecordInput
+统一业务结果对象 BusinessResult
+10.2 request_id
+定义
+
+服务层生成的随机辅助请求标识。
+
+生成方式
+
+当前通过 uuid.uuid4().hex 生成。
+
+作用
+
+增强一笔事务与硬件回调之间的关联强度，降低串单风险。
+
+强制规则
+
+若服务层发出请求时附带了 request_id，则硬件侧回调必须回传该值；缺失、为空或不一致时，服务层必须丢弃对应事件。当前 _on_frame() 已按该规则实现。
+
+10.3 hw_seq
+定义
+
+硬件事件序号。
+
+来源
+
+EVT_USER_ACTION 所属帧的 seq_id。
+
+作用
+落库到 operation_records.hw_seq
+作为事后追溯与核对的硬件确认序号
+10.4 hw_result
+定义
+
+硬件返回的动作确认结果。
+
+来源
+
+EVT_USER_ACTION.payload.confirm_result
+
+当前合法语义
+
+至少包括：
+
+CONFIRMED
+CANCELLED
+TIMEOUT
+10.5 seq_id
+定义
+
+传输层帧序号。
+
+当前实现规则
+
+对服务层主动发起的事务而言，seq_id == request_seq。
+但在设计上不得删除 request_seq，因为后者是业务语义字段，前者是传输层语义字段。
+
+11. 事务匹配与过滤规则
+
+服务层在接收硬件上抛的 EVT_USER_ACTION 时，必须执行如下强制过滤规则：
+
+首先，payload 中必须包含 asset_id、request_seq、action_type，否则事件直接丢弃。
+其次，request_seq 必须可转换为整数，action_type 必须可转换为合法枚举值，否则事件直接丢弃。
+再次，服务层必须根据 asset_id 查询待确认事务池，若不存在对应事务，则视为孤儿事件或迟到事件，直接忽略。
+随后，若事务已收到响应或事件已结束，则视为重复事件，直接忽略。
+最后，必须校验 request_seq、action_type、request_id 与当前待确认事务完全一致，任一不一致均不得推进事务状态。
+
+该规则是服务层契约的一部分，不允许在后续实现中弱化为仅凭 asset_id 或仅凭 request_seq 进行匹配。
+
+12. 原子提交契约
+
+服务层在收到硬件确认成功结果后，必须通过唯一正式提交对象 OperationRecordInput 调用 Repository 的原子提交接口。当前仓储接口已定义：
+
+get_asset_status(asset_id)
+apply_operation_atomically(record)
+rollback_transaction(asset_id, reason)
+
+原子提交的逻辑边界必须满足以下要求：
+
+提交前再次进行资产状态合法性检查
+资产状态更新与流水记录写入必须同事务成功或同事务失败
+任意异常时必须执行回滚或恢复快照
+提交成功后才允许将事务状态置为 COMPLETED
+提交失败时必须将事务状态置为 FAILED 并返回标准 BusinessResult
+
+该约束符合赛题对“关键记录可核对、可复盘”的要求。
+
+13. 与当前代码实现的一致性结论
+
+当前项目背景下，服务层内部契约与核心对象体系已经具备较好的基础一致性。
+
+其一，事务核心对象已经存在，PendingTransaction 已具备业务标识、事务标识、状态字段与硬件回填字段。
+其二，统一业务结果对象已经存在，BusinessResult 可直接作为正式统一出参。
+其三，数据库提交对象已经存在，OperationRecordInput 可直接作为服务层到持久化层的唯一正式入参。
+其四，事务匹配规则已经在服务实现中落地，采用 request_seq + request_id + asset_id + action_type 的联合校验方式，满足当前联调稳定性要求。
+其五，状态机主链已经形成，符合协议与架构文件中“先 ACK、后硬件确认、再数据库更新”的两阶段确认逻辑。
+
+当前仍需在实现层补足的内容，不属于契约缺失，而属于对象显式化不足：即命令对象 BorrowCommand / ReturnCommand 与事件对象 HardwareUserActionEvent 仍主要以内联参数和 payload 拆解形式存在，后续编码阶段应予以类结构化。
+
+14. 正式结论
+
+本设计书将当前 V1 版本服务层内部契约正式定义为：
+
+服务层以 BorrowCommand 与 ReturnCommand 作为正式请求命令对象，以 PendingTransaction 作为待确认事务核心对象，以 SendResult/HardwareAckResult 与 HardwareUserActionEvent 作为硬件事件契约，以 OperationRecordInput 作为唯一正式原子提交对象，以 BusinessResult 作为统一业务出参对象；事务关联必须以 request_seq + request_id + asset_id + action_type 为核心匹配规则，状态推进必须遵循 WAIT_ACK → WAIT_HW → UPDATING → COMPLETED/FAILED 的正式状态语义，并保证 hw_seq 与 hw_result 最终可关联落入业务流水表 operation_records，从而满足赛题对软硬件闭环与关键记录可追溯的要求。

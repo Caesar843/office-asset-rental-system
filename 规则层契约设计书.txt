@@ -1,0 +1,452 @@
+规则层契约设计书
+1. 文档目的
+
+本设计书用于在既有服务层边界定义与服务层内部契约基础上，正式定义后端规则层的职责范围、输入输出对象、判定维度、结果语义与规则矩阵，使 Borrow/Return 两条 V1 核心链路在进入事务创建与硬件确认前，具备统一、可复用、可测试的规则裁决能力。规则层设计完成后，服务层的职责应收敛为“编排流程”，而不再承担分散的业务规则判断。
+
+本设计严格遵循现有项目背景：
+
+服务层负责借出/归还/入库流程编排、规则校验调用、待确认事务创建与推进、硬件确认请求发起、硬件确认结果后的数据库提交触发。
+当前 V1 正式范围仅覆盖借出确认链路与归还确认链路，不将入库流程纳入本阶段正式落地契约范围。
+赛题要求系统支持基础角色区分、基础规则以及至少两类异常/边界处理。
+2. 适用范围
+
+本设计书的正式适用范围为：
+
+借出规则裁决
+归还规则裁决
+基础异常/边界规则裁决
+与 BorrowService / ReturnService 的规则层交互契约
+
+本阶段不正式纳入以下内容：
+
+入库规则正式契约
+续借规则
+预约与冲突检测
+验收规则
+盘点规则
+多角色复杂权限矩阵
+黑名单/信用分的正式数据库落地实现
+
+原因如下：
+
+当前代码中 ActionType 仅包含 BORROW 与 RETURN。
+当前服务实现仅提供借出与归还两条正式入口。
+当前仓储接口仅暴露资产状态查询与原子提交接口，尚未形成用户资格、预约冲突、借期策略等完整数据支撑。
+
+因此，本设计书定义的是：
+
+V1 规则层最小正式契约，用于支撑 Borrow/Return 两条主闭环稳定运行。
+
+3. 规则层定位
+
+规则层在后端总体结构中的定位为：
+
+面向服务层提供统一业务裁决结果的领域规则组件。
+
+其职责不是执行业务事务，也不是维护硬件状态，而是在事务创建之前，基于请求上下文、资产状态、用户状态与动作类型，裁定“该请求是否允许继续进入硬件确认阶段”。后端总体结构图与服务层边界定义均已明确，RuleService 属于应用服务层的核心子模块之一，负责权限、可借规则、基础异常判断等裁决任务。
+
+4. 规则层职责与非职责
+4.1 规则层负责范围
+
+规则层负责：
+
+判断资产是否存在
+判断资产当前状态是否允许执行目标动作
+判断动作类型是否合法
+判断是否存在同资产待确认事务冲突
+判断设备当前是否允许继续发起请求
+输出统一规则裁决结果，供 BorrowService / ReturnService 使用
+为后续扩展黑名单、信用分、借期规则预留稳定接口
+4.2 规则层不负责范围
+
+规则层不负责：
+
+不创建 PendingTransaction
+不直接调用串口层发送硬件确认请求
+不接收 ACK / EVT_USER_ACTION / EVT_HEARTBEAT
+不直接改写数据库
+不做 SQL / ORM 细节处理
+不拼接前端展示数据
+不做事务最终成功/失败收口
+
+这一分工与既有服务层边界定义完全一致：服务层负责编排，串口层不做业务判断，Repository 负责持久化边界。
+
+5. 规则层设计原则
+5.1 前置裁决原则
+
+所有可在事务创建前判断出的非法请求，必须在进入硬件确认前被规则层拦截。赛题要求关键流程通过硬件确认终端完成，但并不意味着所有非法请求都应先下发给 MCU；明显不合法的请求应由后端先行裁决。
+
+5.2 单一出口原则
+
+BorrowService 与 ReturnService 不应各自散落实现状态判断、设备离线判断、并发冲突判断，而应统一通过规则层得到标准化裁决结果。
+
+5.3 可解释原则
+
+每次规则裁决必须输出：
+
+是否通过
+失败码
+失败消息
+可选附加上下文
+
+从而支持 API 返回、日志输出、测试断言与后续 WebSocket 通知。
+
+5.4 与现有实现兼容原则
+
+当前 service.py 中已经存在基础状态判断函数 validate_asset_transition()，并在服务入口阶段完成“资产不存在”“状态不合法”“同资产已有待确认事务”“设备离线”等拦截。规则层设计必须将这些散落逻辑正式上收为 RuleService 契约，而不是推翻现有 V1 内核。
+
+6. 规则层对象设计
+6.1 规则请求对象 RuleCheckRequest
+定义目的
+
+表示一笔待裁决业务请求的规则上下文。
+
+字段
+asset_id: str
+user_id: str
+user_name: str
+action_type: ActionType
+device_status: DeviceStatus
+asset_status: AssetStatus | None
+has_pending_transaction: bool
+字段说明
+asset_id：待操作资产标识
+user_id：当前操作者标识
+user_name：当前操作者展示名
+action_type：目标动作，仅允许 BORROW / RETURN
+device_status：当前设备状态，来源于串口层上抛的 DeviceStatus
+asset_status：当前资产状态；若资产不存在则为 None
+has_pending_transaction：同一资产是否已存在待确认事务
+设计依据
+
+当前服务实现中，借还流程在创建事务前已显式依赖：
+
+设备状态 DeviceStatus
+当前资产状态
+同资产是否已有待确认事务
+动作类型 ActionType
+6.2 规则裁决结果对象 RuleCheckResult
+定义目的
+
+表示规则层对一笔请求的正式裁决结果。
+
+字段
+passed: bool
+code: str
+message: str
+action_type: ActionType
+asset_id: str
+user_id: str
+extra: dict[str, Any] = {}
+字段语义
+passed：规则是否通过
+code：标准结果码
+message：可读说明
+action_type：原始动作
+asset_id：原始资产标识
+user_id：原始操作者标识
+extra：补充上下文，例如当前资产状态
+结果码来源约束
+
+V1 规则层必须与既有 ConfirmResult 语义兼容，优先复用如下码值：
+
+DEVICE_OFFLINE
+ASSET_NOT_FOUND
+STATE_INVALID
+BUSY
+INTERNAL_ERROR
+
+规则层不应新造与现有 BusinessResult.code 不兼容的结果码。
+
+7. 规则层核心接口设计
+7.1 主接口 check_request
+定义
+
+check_request(request: RuleCheckRequest) -> RuleCheckResult
+
+语义
+
+对借出或归还请求执行完整的前置规则裁决。
+
+执行顺序
+设备状态校验
+动作类型合法性校验
+资产存在性校验
+资产状态流转合法性校验
+同资产并发事务冲突校验
+通过则返回统一放行结果
+输出要求
+必须始终返回 RuleCheckResult
+不得抛出正常业务异常到服务层
+仅在真正的系统级异常时允许返回 INTERNAL_ERROR
+7.2 子规则接口
+
+为保证规则层可组合、可测试，主接口内部应拆分为若干子规则函数。
+
+7.2.1 check_device_status
+
+裁决设备是否允许继续发起请求。
+
+7.2.2 check_action_type
+
+裁决动作类型是否合法。
+
+7.2.3 check_asset_exists
+
+裁决资产是否存在。
+
+7.2.4 check_asset_transition
+
+裁决当前资产状态是否允许目标动作。
+
+7.2.5 check_pending_conflict
+
+裁决同资产是否已有待确认事务。
+
+8. 借出规则矩阵设计
+8.1 借出规则目标
+
+借出规则用于裁决：
+当前请求是否允许从“服务层入口”进入“硬件确认阶段”。
+
+赛题要求系统支持资产状态管理与借用核心流程，并要求借出等关键环节可被追溯。
+数据库模型也明确资产状态包括在库、借出、维修、报废。
+
+8.2 借出规则矩阵
+规则 B-01：设备必须在线
+条件：device_status == OFFLINE
+结果：不通过
+码值：DEVICE_OFFLINE
+消息：设备离线，无法发起确认请求
+规则 B-02：资产必须存在
+条件：asset_status is None
+结果：不通过
+码值：ASSET_NOT_FOUND
+消息：资产不存在，无法发起确认请求
+规则 B-03：资产状态为在库时允许借出
+条件：asset_status == IN_STOCK
+结果：通过
+规则 B-04：借出状态资产禁止再次借出
+条件：asset_status == BORROWED
+结果：不通过
+码值：STATE_INVALID
+消息：资产当前处于借出状态，不允许再次发起借出
+规则 B-05：维修状态资产禁止借出
+条件：asset_status == MAINTENANCE
+结果：不通过
+码值：STATE_INVALID
+消息：资产当前处于维修状态，禁止发起借出
+规则 B-06：报废状态资产禁止借出
+条件：asset_status == SCRAPPED
+结果：不通过
+码值：STATE_INVALID
+消息：资产当前处于报废状态，禁止发起借出
+规则 B-07：同资产已有待确认事务时禁止重复发起
+条件：has_pending_transaction == True
+结果：不通过
+码值：BUSY
+消息：该资产已有待确认事务，请勿重复提交
+
+上述 B-03 ~ B-06 与当前 validate_asset_transition() 的既有实现完全一致，应正式上收为规则层裁决契约。
+
+9. 归还规则矩阵设计
+9.1 归还规则目标
+
+归还规则用于裁决：
+当前请求是否允许进入归还硬件确认阶段。
+
+赛题要求系统支持借出确认、归还确认等核心流程。
+
+9.2 归还规则矩阵
+规则 R-01：设备必须在线
+条件：device_status == OFFLINE
+结果：不通过
+码值：DEVICE_OFFLINE
+消息：设备离线，无法发起确认请求
+规则 R-02：资产必须存在
+条件：asset_status is None
+结果：不通过
+码值：ASSET_NOT_FOUND
+消息：资产不存在，无法发起确认请求
+规则 R-03：借出状态资产允许归还
+条件：asset_status == BORROWED
+结果：通过
+规则 R-04：在库状态资产禁止归还
+条件：asset_status == IN_STOCK
+结果：不通过
+码值：STATE_INVALID
+消息：资产当前处于在库状态，不允许发起归还
+规则 R-05：维修状态资产禁止归还
+条件：asset_status == MAINTENANCE
+结果：不通过
+码值：STATE_INVALID
+消息：资产当前处于维修状态，禁止发起归还
+规则 R-06：报废状态资产禁止归还
+条件：asset_status == SCRAPPED
+结果：不通过
+码值：STATE_INVALID
+消息：资产当前处于报废状态，禁止发起归还
+规则 R-07：同资产已有待确认事务时禁止重复发起
+条件：has_pending_transaction == True
+结果：不通过
+码值：BUSY
+消息：该资产已有待确认事务，请勿重复提交
+
+上述 R-03 ~ R-06 同样与现有 validate_asset_transition() 的归还逻辑一致。
+
+10. 基础异常/边界规则设计
+
+赛题要求系统支持至少两类异常/边界处理，例如逾期、损坏申报、丢失申报、借用冲突或资产不可用等。
+当前 V1 规则层正式纳入以下两类基础异常/边界：
+
+10.1 借用冲突
+
+体现为同一资产已有待确认事务时的新请求冲突。
+当前服务实现已通过 _pending_by_asset 保证“同一资产同一时刻只允许存在一笔待确认事务”。
+规则层应将此正式定义为：
+
+异常类型：BUSY
+触发点：事务创建前
+处理方式：直接拒绝，不进入硬件确认
+10.2 资产不可用
+
+体现为资产处于维修或报废状态时，禁止进入借出或归还流程。
+数据库模型与协议定义均明确了维修、报废状态属于资产生命周期的正式状态。
+规则层应将其正式定义为：
+
+异常类型：STATE_INVALID
+触发点：规则前置裁决阶段
+处理方式：直接拒绝，不进入硬件确认
+11. 规则层与服务层的交互契约
+11.1 BorrowService 调用规则层的时机
+
+BorrowService 在进入下列动作之前，必须先调用规则层：
+
+生成 request_id
+预留 request_seq
+创建 PendingTransaction
+调用串口层发送 CMD_REQ_CONFIRM
+
+也就是说，规则层调用必须发生在事务创建之前。
+
+11.2 ReturnService 调用规则层的时机
+
+ReturnService 同 BorrowService，必须在创建事务和发送请求前完成规则裁决。
+
+11.3 调用结果分支
+当规则通过时
+
+BorrowService / ReturnService 才允许继续：
+
+生成事务标识
+创建 PendingTransaction
+调用 SerialManager.send_request()
+当规则失败时
+
+BorrowService / ReturnService 必须：
+
+不创建事务
+不调用串口层
+直接将 RuleCheckResult 映射为 BusinessResult
+
+这一点符合既有服务层设计：服务层负责编排，规则层负责裁决。
+
+12. 规则层与当前代码的映射关系
+
+当前 service.py 中，规则逻辑主要分散在以下位置：
+
+12.1 设备离线校验
+
+当前 _request_action() 起始阶段直接判断 device_status == OFFLINE，失败时返回 DEVICE_OFFLINE。
+
+12.2 资产存在性校验
+
+当前 _request_action() 调用 get_asset_status()，若结果为 None，直接返回 ASSET_NOT_FOUND。
+
+12.3 资产状态流转校验
+
+当前 validate_asset_transition() 已实现借出/归还的核心状态校验逻辑。
+
+12.4 同资产待确认事务冲突校验
+
+当前 _request_action() 在 _pending_by_asset 中检测同资产是否已有待确认事务，并返回 BUSY。
+
+因此，第三步设计的本质不是推翻现有逻辑，而是：
+
+将现有散落在 AssetConfirmService 中的前置规则判断，正式抽象为独立 RuleService 契约。
+
+13. 规则层建议实现形态
+13.1 推荐类名
+
+RuleService
+
+13.2 推荐方法清单
+check_request(request: RuleCheckRequest) -> RuleCheckResult
+check_borrow(request: RuleCheckRequest) -> RuleCheckResult
+check_return(request: RuleCheckRequest) -> RuleCheckResult
+check_device_status(request: RuleCheckRequest) -> RuleCheckResult | None
+check_asset_exists(request: RuleCheckRequest) -> RuleCheckResult | None
+check_asset_transition(request: RuleCheckRequest) -> RuleCheckResult | None
+check_pending_conflict(request: RuleCheckRequest) -> RuleCheckResult | None
+13.3 推荐调用结构
+
+check_request()
+→ 根据 action_type 分发到 check_borrow() 或 check_return()
+→ 顺序执行各子规则
+→ 返回首个失败结果或最终通过结果
+
+14. 规则层与赛题要求的一致性说明
+
+本设计满足赛题以下要求：
+
+14.1 满足基础规则要求
+
+赛题要求支持基础规则，例如可借时长、是否可续借、是否可预约等，规则可以简化但需明确。当前 V1 规则层先将“资产状态合法性、设备在线性、借用冲突、资产不可用”作为正式简化规则落地。
+
+14.2 满足基础异常处理要求
+
+赛题要求支持至少两类异常/边界处理。当前 V1 规则层正式纳入：
+
+借用冲突
+资产不可用
+两类异常/边界。
+14.3 为后续加分项预留扩展点
+
+赛题加分项包括信用分、黑名单、不同资产不同规则、续借与预约等。
+当前数据库模型已预留 users.credit_score 与 users.status 字段，说明信用分与黑名单具备后续规则扩展基础。
+但由于当前 V1 仓储与服务入口尚未对这些字段形成正式查询与裁决链路，因此本阶段只在规则层接口上预留扩展能力，不写入正式 V1 强制规则。
+
+15. 第三步成熟判定标准
+
+第三步“规则层契约设计”成熟的判定标准如下：
+
+15.1 范围成熟
+只覆盖 Borrow/Return 两条 V1 正式链路
+不虚写 Inbound、预约、续借等未落地规则
+15.2 规则收口成熟
+设备离线、资产不存在、状态不合法、同资产待确认事务冲突四类核心前置规则全部被规则层接管
+不再散落在多个服务方法中重复判断
+15.3 结果语义成熟
+所有规则失败均输出统一 RuleCheckResult
+码值与既有 ConfirmResult 语义兼容
+服务层可无损映射为 BusinessResult
+15.4 可实现成熟
+按本设计书可直接把 service.py 中前置规则抽到 RuleService
+BorrowService / ReturnService 能无歧义接入
+不需要重新设计事务对象和状态机
+15.5 可测试成熟
+
+至少可以直接写出以下测试：
+
+借出时设备离线应失败
+借出时资产不存在应失败
+借出时资产为借出/维修/报废应失败
+归还时资产为在库/维修/报废应失败
+同资产重复提交应失败
+合法借出请求应通过
+合法归还请求应通过
+16. 正式结论
+
+本设计书将第三步正式定义为：
+
+在既有服务层边界与服务层内部契约不变的前提下，将 Borrow/Return 两条 V1 主链路中的前置业务判断正式上收为 RuleService，统一形成以 RuleCheckRequest 为输入、以 RuleCheckResult 为输出的规则裁决层，并以“设备在线性、资产存在性、资产状态流转合法性、同资产待确认事务冲突”作为当前 V1 的正式规则集合，使服务层从分散判断转为规则调用，确保后续事务创建、硬件确认与原子提交建立在统一、可解释、可测试的规则基础之上。
