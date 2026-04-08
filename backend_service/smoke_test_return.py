@@ -18,29 +18,30 @@ def configure_logging() -> None:
 
 def main() -> None:
     configure_logging()
-    mock_server = MockMCUServer(host="127.0.0.1", port=9100, mode="confirmed", confirm_delay=1.0)
+    mock_server = MockMCUServer(host="127.0.0.1", port=9101, mode="confirmed", confirm_delay=1.0)
     mock_server.start()
     time.sleep(0.3)
 
-    serial_manager = SerialManager(port="socket://127.0.0.1:9100")
-    repository = InMemoryTransactionRepository(initial_assets={"AS-0924": AssetStatus.IN_STOCK})
+    serial_manager = SerialManager(port="socket://127.0.0.1:9101")
+    repository = InMemoryTransactionRepository(initial_assets={"AS-0925": AssetStatus.BORROWED})
     service = AssetConfirmService(serial_manager=serial_manager, repository=repository)
 
     try:
         service.open()
         time.sleep(0.5)
-        result = service.request_asset_borrow_confirm(
-            asset_id="AS-0924",
-            user_id="U-1001",
-            user_name="赵子墨",
+        result = service.request_asset_return_confirm(
+            asset_id="AS-0925",
+            user_id="U-1002",
+            user_name="苏明月",
             timeout_ms=5000,
         )
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         assert result.success is True
         assert result.code == "CONFIRMED"
         assert result.hw_result == "CONFIRMED"
-        assert result.user_id == "U-1001"
+        assert result.user_id == "U-1002"
         assert result.request_seq == result.seq_id
+        assert repository.assets["AS-0925"] == AssetStatus.IN_STOCK
     finally:
         service.close()
         mock_server.stop()

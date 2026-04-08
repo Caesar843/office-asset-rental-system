@@ -5,9 +5,11 @@ import json
 import logging
 import time
 
+import runtime_paths  # noqa: F401
 from models import AssetStatus
+from repository import InMemoryTransactionRepository
 from serial_manager import SerialManager
-from service import AssetConfirmService, InMemoryTransactionRepository
+from service import AssetConfirmService
 
 CLI_STATUS_MAP = {
     "in_stock": AssetStatus.IN_STOCK,

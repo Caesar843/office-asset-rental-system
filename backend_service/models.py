@@ -47,6 +47,39 @@ class AssetStatus(str, Enum):
     SCRAPPED = "报废"
 
 
+def _validate_command_fields(asset_id: str, user_id: str, user_name: str, timeout_ms: int) -> None:
+    if not asset_id.strip():
+        raise ValueError("asset_id 不能为空")
+    if not user_id.strip():
+        raise ValueError("user_id 不能为空")
+    if not user_name.strip():
+        raise ValueError("user_name 不能为空")
+    if timeout_ms <= 0:
+        raise ValueError("timeout_ms 必须为正整数")
+
+
+@dataclass(slots=True)
+class BorrowCommand:
+    asset_id: str
+    user_id: str
+    user_name: str
+    timeout_ms: int = 30000
+
+    def __post_init__(self) -> None:
+        _validate_command_fields(self.asset_id, self.user_id, self.user_name, self.timeout_ms)
+
+
+@dataclass(slots=True)
+class ReturnCommand:
+    asset_id: str
+    user_id: str
+    user_name: str
+    timeout_ms: int = 30000
+
+    def __post_init__(self) -> None:
+        _validate_command_fields(self.asset_id, self.user_id, self.user_name, self.timeout_ms)
+
+
 @dataclass(slots=True)
 class BusinessResult:
     success: bool
@@ -74,6 +107,28 @@ class BusinessResult:
 
 
 @dataclass(slots=True)
+class RuleCheckRequest:
+    asset_id: str
+    user_id: str
+    user_name: str
+    action_type: ActionType
+    device_status: DeviceStatus
+    asset_status: AssetStatus | None
+    has_pending_transaction: bool
+
+
+@dataclass(slots=True)
+class RuleCheckResult:
+    passed: bool
+    code: str
+    message: str
+    action_type: ActionType
+    asset_id: str
+    user_id: str
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class OperationRecordInput:
     asset_id: str
     user_id: str
@@ -85,6 +140,17 @@ class OperationRecordInput:
     hw_result: str
     hw_sn: str | None = None
     due_time: str | None = None
+
+
+@dataclass(slots=True)
+class HardwareUserActionEvent:
+    hw_seq: int
+    asset_id: str
+    request_seq: int
+    request_id: str | None
+    action_type: ActionType
+    confirm_result: str
+    hw_sn: str | None = None
 
 
 @dataclass(slots=True)

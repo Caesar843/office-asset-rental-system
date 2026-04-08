@@ -1,151 +1,54 @@
 from __future__ import annotations
 
 import logging
-import threading
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable
 
+import runtime_paths  # noqa: F401
 from models import (
     ActionType,
     AssetStatus,
+    BorrowCommand,
     BusinessResult,
     ConfirmResult,
     DeviceStatus,
     OperationRecordInput,
     PendingTransaction,
+    ReturnCommand,
+    RuleCheckRequest,
     TransactionState,
 )
 from protocol import Frame, MsgType
+from repository import TransactionRepository
+from rule_service import RuleService
 from serial_manager import SendResult, SerialManager
+from transaction_manager import BusyTransactionError, TransactionManager
 
 LOGGER = logging.getLogger(__name__)
-
-
-class TransactionRepository(Protocol):
-    def get_asset_status(self, asset_id: str) -> AssetStatus | None: ...
-
-    def apply_operation_atomically(self, record: OperationRecordInput) -> AssetStatus: ...
-
-    def rollback_transaction(self, asset_id: str, reason: str) -> None: ...
-
-
-def validate_asset_transition(current_status: AssetStatus, action_type: ActionType) -> str | None:
-    if action_type == ActionType.BORROW:
-        if current_status == AssetStatus.IN_STOCK:
-            return None
-        if current_status == AssetStatus.BORROWED:
-            return "资产当前处于借出状态，不允许再次发起借出"
-        if current_status == AssetStatus.MAINTENANCE:
-            return "资产当前处于维修状态，禁止发起借出"
-        return "资产当前处于报废状态，禁止发起借出"
-
-    if current_status == AssetStatus.BORROWED:
-        return None
-    if current_status == AssetStatus.IN_STOCK:
-        return "资产当前处于在库状态，不允许发起归还"
-    if current_status == AssetStatus.MAINTENANCE:
-        return "资产当前处于维修状态，禁止发起归还"
-    return "资产当前处于报废状态，禁止发起归还"
-
-
-class InMemoryTransactionRepository:
-    """
-    Demo repository with explicit atomic commit semantics.
-
-    The method apply_operation_atomically owns the transaction boundary:
-    state validation + asset update + operation_records append either all
-    succeed or the in-memory snapshot is restored.
-    """
-
-    def __init__(self, initial_assets: dict[str, AssetStatus] | None = None) -> None:
-        self.assets: dict[str, AssetStatus] = dict(initial_assets or {})
-        self.records: list[OperationRecordInput] = []
-        self._lock = threading.Lock()
-        self._snapshots: dict[str, tuple[bool, AssetStatus | None, int]] = {}
-
-    def get_asset_status(self, asset_id: str) -> AssetStatus | None:
-        with self._lock:
-            return self.assets.get(asset_id)
-
-    def apply_operation_atomically(self, record: OperationRecordInput) -> AssetStatus:
-        with self._lock:
-            current_status = self.assets.get(record.asset_id)
-            if current_status is None:
-                raise LookupError(f"资产不存在: {record.asset_id}")
-            invalid_reason = validate_asset_transition(current_status, record.action_type)
-            if invalid_reason is not None:
-                raise ValueError(invalid_reason)
-
-            existed = record.asset_id in self.assets
-            previous_status = self.assets.get(record.asset_id)
-            snapshot = (existed, previous_status, len(self.records))
-            self._snapshots[record.asset_id] = snapshot
-
-            try:
-                new_status = AssetStatus.BORROWED if record.action_type == ActionType.BORROW else AssetStatus.IN_STOCK
-                self.assets[record.asset_id] = new_status
-                self.records.append(record)
-            except Exception:
-                self._restore_snapshot_locked(record.asset_id)
-                raise
-
-            self._snapshots.pop(record.asset_id, None)
-            LOGGER.info(
-                "repository commit success: asset_id=%s action=%s request_seq=%s hw_seq=%s hw_result=%s",
-                record.asset_id,
-                record.action_type.value,
-                record.request_seq,
-                record.hw_seq,
-                record.hw_result,
-            )
-            return new_status
-
-    def rollback_transaction(self, asset_id: str, reason: str) -> None:
-        with self._lock:
-            restored = self._restore_snapshot_locked(asset_id)
-        LOGGER.warning("repository rollback: asset_id=%s restored=%s reason=%s", asset_id, restored, reason)
-
-    def _restore_snapshot_locked(self, asset_id: str) -> bool:
-        snapshot = self._snapshots.pop(asset_id, None)
-        if snapshot is None:
-            return False
-
-        existed, previous_status, records_len = snapshot
-        if existed and previous_status is not None:
-            self.assets[asset_id] = previous_status
-        else:
-            self.assets.pop(asset_id, None)
-
-        if len(self.records) > records_len:
-            del self.records[records_len:]
-        return True
-
-
-@dataclass(slots=True)
-class TransactionContext:
-    pending: PendingTransaction
-    event: threading.Event = field(default_factory=threading.Event)
 
 
 class AssetConfirmService:
     """
     Business service layer suitable for CLI, FastAPI or Flask integration.
 
-    Serial IO stays in SerialManager. This layer owns request correlation,
-    business rules, and transaction commit policy.
+    Serial IO stays in SerialManager. This layer owns orchestration only:
+    rule check, transaction lifecycle coordination, repository commit and
+    final BusinessResult assembly.
     """
 
     def __init__(
         self,
         serial_manager: SerialManager,
-        repository: TransactionRepository | None = None,
+        repository: TransactionRepository,
+        rule_service: RuleService | None = None,
+        transaction_manager: TransactionManager | None = None,
+        status_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.serial_manager = serial_manager
-        self.repository = repository or InMemoryTransactionRepository()
-
-        self._pending_by_asset: dict[str, TransactionContext] = {}
-        self._lock = threading.Lock()
+        self.repository = repository
+        self.rule_service = rule_service or RuleService()
+        self.transaction_manager = transaction_manager or TransactionManager()
+        self._status_callback = status_callback
         self._device_status = DeviceStatus.UNKNOWN
 
         self.serial_manager.set_frame_handler(self._on_frame)
@@ -161,6 +64,27 @@ class AssetConfirmService:
     def close(self) -> None:
         self.serial_manager.close()
 
+    def update_device_status(self, status: DeviceStatus) -> None:
+        self._on_status_changed(status)
+
+    def request_borrow(self, command: BorrowCommand) -> BusinessResult:
+        return self._request_action(
+            asset_id=command.asset_id,
+            user_id=command.user_id,
+            user_name=command.user_name,
+            action_type=ActionType.BORROW,
+            timeout_ms=command.timeout_ms,
+        )
+
+    def request_return(self, command: ReturnCommand) -> BusinessResult:
+        return self._request_action(
+            asset_id=command.asset_id,
+            user_id=command.user_id,
+            user_name=command.user_name,
+            action_type=ActionType.RETURN,
+            timeout_ms=command.timeout_ms,
+        )
+
     def request_asset_borrow_confirm(
         self,
         asset_id: str,
@@ -168,12 +92,8 @@ class AssetConfirmService:
         user_name: str,
         timeout_ms: int = 30000,
     ) -> BusinessResult:
-        return self._request_action(
-            asset_id=asset_id,
-            user_id=user_id,
-            user_name=user_name,
-            action_type=ActionType.BORROW,
-            timeout_ms=timeout_ms,
+        return self.request_borrow(
+            BorrowCommand(asset_id=asset_id, user_id=user_id, user_name=user_name, timeout_ms=timeout_ms)
         )
 
     def request_asset_return_confirm(
@@ -183,12 +103,8 @@ class AssetConfirmService:
         user_name: str,
         timeout_ms: int = 30000,
     ) -> BusinessResult:
-        return self._request_action(
-            asset_id=asset_id,
-            user_id=user_id,
-            user_name=user_name,
-            action_type=ActionType.RETURN,
-            timeout_ms=timeout_ms,
+        return self.request_return(
+            ReturnCommand(asset_id=asset_id, user_id=user_id, user_name=user_name, timeout_ms=timeout_ms)
         )
 
     def get_asset_status(self, asset_id: str) -> AssetStatus | None:
@@ -202,64 +118,38 @@ class AssetConfirmService:
         action_type: ActionType,
         timeout_ms: int,
     ) -> BusinessResult:
-        if self.device_status == DeviceStatus.OFFLINE:
-            return self._build_result(
-                success=False,
-                code=ConfirmResult.DEVICE_OFFLINE.value,
-                message="设备离线，无法发起确认请求",
-                asset_id=asset_id,
-                action_type=action_type,
-                user_id=user_id,
-                user_name=user_name,
-                seq_id=-1,
-                request_seq=None,
-                request_id=None,
-                state=TransactionState.FAILED,
-            )
-
         current_status = self.get_asset_status(asset_id)
-        if current_status is None:
-            LOGGER.warning("request blocked: asset not found asset_id=%s action=%s", asset_id, action_type.value)
-            return self._build_result(
-                success=False,
-                code=ConfirmResult.ASSET_NOT_FOUND.value,
-                message="资产不存在，无法发起确认请求",
-                asset_id=asset_id,
-                action_type=action_type,
-                user_id=user_id,
-                user_name=user_name,
-                seq_id=-1,
-                request_seq=None,
-                request_id=None,
-                state=TransactionState.FAILED,
-            )
-        invalid_reason = validate_asset_transition(current_status, action_type)
-        if invalid_reason is not None:
-            LOGGER.warning(
-                "state validation blocked request: asset_id=%s action=%s status=%s reason=%s",
-                asset_id,
-                action_type.value,
-                current_status.value,
-                invalid_reason,
-            )
-            return self._build_result(
-                success=False,
-                code=ConfirmResult.STATE_INVALID.value,
-                message=invalid_reason,
-                asset_id=asset_id,
-                action_type=action_type,
-                user_id=user_id,
-                user_name=user_name,
-                seq_id=-1,
-                request_seq=None,
-                request_id=None,
-                state=TransactionState.FAILED,
-                extra={"asset_status": current_status.value},
-            )
+        rule_request = RuleCheckRequest(
+            asset_id=asset_id,
+            user_id=user_id,
+            user_name=user_name,
+            action_type=action_type,
+            device_status=self.device_status,
+            asset_status=current_status,
+            has_pending_transaction=self.transaction_manager.has_pending_transaction(asset_id),
+        )
+        rule_result = self.rule_service.check_request(rule_request)
+        if not rule_result.passed:
+            return self._return_with_status(self._rule_result_to_business_result(rule_result, user_name))
 
-        with self._lock:
-            if asset_id in self._pending_by_asset:
-                return self._build_result(
+        if current_status is None:
+            raise AssertionError("rule check passed but asset status is missing")
+
+        request_id = uuid.uuid4().hex
+        request_seq = self.serial_manager.reserve_seq_id()
+
+        try:
+            tx = self.transaction_manager.create_transaction(
+                asset_id=asset_id,
+                user_id=user_id,
+                user_name=user_name,
+                action_type=action_type,
+                request_id=request_id,
+                request_seq=request_seq,
+            )
+        except BusyTransactionError:
+            return self._return_with_status(
+                self._build_result(
                     success=False,
                     code=ConfirmResult.BUSY.value,
                     message="该资产已有待确认事务，请勿重复提交",
@@ -273,21 +163,10 @@ class AssetConfirmService:
                     state=TransactionState.FAILED,
                     extra={"asset_status": current_status.value},
                 )
-            request_id = uuid.uuid4().hex
-            request_seq = self.serial_manager.reserve_seq_id()
-            tx = PendingTransaction(
-                asset_id=asset_id,
-                user_id=user_id,
-                user_name=user_name,
-                action_type=action_type,
-                request_id=request_id,
-                request_seq=request_seq,
-                state=TransactionState.WAIT_ACK,
             )
-            context = TransactionContext(pending=tx)
-            self._pending_by_asset[asset_id] = context
 
         try:
+            self._publish_pending_status(tx, code="WAITING_ACK", message="事务已创建，等待 ACK")
             payload = {
                 "asset_id": asset_id,
                 "action_type": action_type.value,
@@ -297,12 +176,17 @@ class AssetConfirmService:
                 "request_seq": request_seq,
                 "wait_timeout": timeout_ms,
             }
-            send_result: SendResult = self.serial_manager.send_request(MsgType.CMD_REQ_CONFIRM, payload, seq_id=request_seq)
+            send_result: SendResult = self.serial_manager.send_request(
+                MsgType.CMD_REQ_CONFIRM,
+                payload,
+                seq_id=request_seq,
+            )
             if not send_result.success:
-                tx.state = TransactionState.FAILED
-                return self._result_from_send_failure(tx, send_result, current_status)
+                tx = self.transaction_manager.mark_ack_failure(asset_id, send_result.message)
+                return self._return_with_status(self._result_from_send_failure(tx, send_result, current_status))
 
-            tx.state = TransactionState.WAIT_HW
+            tx = self.transaction_manager.mark_ack_success(asset_id)
+            self._publish_pending_status(tx, code="WAITING_HW", message="已收到 ACK，等待硬件确认")
             LOGGER.info(
                 "business waiting hw result: asset_id=%s action=%s request_seq=%s request_id=%s timeout_ms=%s",
                 asset_id,
@@ -311,167 +195,46 @@ class AssetConfirmService:
                 tx.request_id,
                 timeout_ms,
             )
-            wait_seconds = timeout_ms / 1000.0 + 5.0
-            if not context.event.wait(wait_seconds):
-                tx.state = TransactionState.FAILED
-                tx.error_message = "等待 EVT_USER_ACTION 超时"
-                LOGGER.error(
-                    "business hw result timeout: asset_id=%s request_seq=%s request_id=%s timeout_s=%.1f",
-                    asset_id,
-                    tx.request_seq,
-                    tx.request_id,
-                    wait_seconds,
-                )
-                return self._build_result(
-                    success=False,
-                    code=ConfirmResult.HW_RESULT_TIMEOUT.value,
-                    message="已收到 ACK，但等待硬件确认结果超时",
-                    asset_id=asset_id,
-                    action_type=action_type,
-                    user_id=user_id,
-                    user_name=user_name,
-                    seq_id=tx.request_seq,
-                    request_seq=tx.request_seq,
-                    request_id=tx.request_id,
-                    state=tx.state,
-                    extra={"asset_status": current_status.value},
+
+            wait_result = self.transaction_manager.wait_for_hw_result(asset_id, timeout_ms)
+            if wait_result.timed_out:
+                return self._return_with_status(
+                    self._build_result(
+                        success=False,
+                        code=ConfirmResult.HW_RESULT_TIMEOUT.value,
+                        message="已收到 ACK，但等待硬件确认结果超时",
+                        asset_id=asset_id,
+                        action_type=action_type,
+                        user_id=user_id,
+                        user_name=user_name,
+                        seq_id=wait_result.pending.request_seq,
+                        request_seq=wait_result.pending.request_seq,
+                        request_id=wait_result.pending.request_id,
+                        state=wait_result.pending.state,
+                        extra={"asset_status": current_status.value},
+                    )
                 )
 
-            return self._finalize_transaction(tx)
+            return self._return_with_status(self._finalize_transaction(wait_result.pending))
         finally:
-            with self._lock:
-                self._pending_by_asset.pop(asset_id, None)
+            self.transaction_manager.remove_transaction(asset_id)
 
     def _on_frame(self, frame: Frame) -> None:
-        if frame.msg_type != MsgType.EVT_USER_ACTION:
-            LOGGER.info("business ignored frame: msg_type=%s", frame.msg_type.name)
-            return
-
-        payload = frame.payload if isinstance(frame.payload, dict) else {}
-        asset_id = str(payload.get("asset_id", "")).strip()
-        raw_request_seq = payload.get("request_seq")
-        raw_action_type = str(payload.get("action_type", "")).strip()
-        has_request_id = "request_id" in payload
-        raw_request_id = payload.get("request_id") if has_request_id else None
-        request_id = None if raw_request_id is None else str(raw_request_id).strip() or None
-
-        if not asset_id or raw_request_seq is None or not raw_action_type:
-            LOGGER.warning(
-                "discard EVT_USER_ACTION with missing correlation fields: hw_seq=%s payload=%s",
-                frame.seq_id,
-                payload,
-            )
-            return
-
-        try:
-            request_seq = int(raw_request_seq)
-        except (TypeError, ValueError):
-            LOGGER.warning("discard EVT_USER_ACTION with invalid request_seq: hw_seq=%s payload=%s", frame.seq_id, payload)
-            return
-
-        try:
-            action_type = ActionType(raw_action_type)
-        except ValueError:
-            LOGGER.warning("discard EVT_USER_ACTION with invalid action_type: hw_seq=%s payload=%s", frame.seq_id, payload)
-            return
-
-        with self._lock:
-            context = self._pending_by_asset.get(asset_id)
-        if context is None:
-            LOGGER.warning(
-                "late/orphan EVT_USER_ACTION ignored: asset_id=%s request_seq=%s action=%s hw_seq=%s request_id=%s",
-                asset_id,
-                request_seq,
-                action_type.value,
-                frame.seq_id,
-                request_id,
-            )
-            return
-
-        tx = context.pending
-        if tx.response_received or context.event.is_set():
-            LOGGER.warning(
-                "duplicate EVT_USER_ACTION ignored: asset_id=%s expected_request_seq=%s hw_seq=%s",
-                asset_id,
-                tx.request_seq,
-                frame.seq_id,
-            )
-            return
-
-        if request_seq != tx.request_seq:
-            LOGGER.warning(
-                "mismatched EVT_USER_ACTION request_seq ignored: asset_id=%s expected=%s actual=%s hw_seq=%s",
-                asset_id,
-                tx.request_seq,
-                request_seq,
-                frame.seq_id,
-            )
-            return
-
-        if action_type != tx.action_type:
-            LOGGER.warning(
-                "mismatched EVT_USER_ACTION action ignored: asset_id=%s expected=%s actual=%s request_seq=%s",
-                asset_id,
-                tx.action_type.value,
-                action_type.value,
-                request_seq,
-            )
-            return
-
-        if tx.request_id is not None:
-            if not has_request_id or raw_request_id is None:
-                LOGGER.warning(
-                    "missing EVT_USER_ACTION request_id ignored: asset_id=%s expected=%s request_seq=%s hw_seq=%s",
-                    asset_id,
-                    tx.request_id,
-                    request_seq,
-                    frame.seq_id,
-                )
-                return
-            if request_id is None:
-                LOGGER.warning(
-                    "empty EVT_USER_ACTION request_id ignored: asset_id=%s expected=%s actual=%r request_seq=%s hw_seq=%s",
-                    asset_id,
-                    tx.request_id,
-                    raw_request_id,
-                    request_seq,
-                    frame.seq_id,
-                )
-                return
-            if request_id != tx.request_id:
-                LOGGER.warning(
-                    "mismatched EVT_USER_ACTION request_id ignored: asset_id=%s expected=%s actual=%s request_seq=%s hw_seq=%s",
-                    asset_id,
-                    tx.request_id,
-                    request_id,
-                    request_seq,
-                    frame.seq_id,
-                )
-                return
-
-        tx.hw_seq = frame.seq_id
-        tx.hw_result = str(payload.get("confirm_result", "")).strip() or ConfirmResult.INTERNAL_ERROR.value
-        tx.hw_sn = str(payload.get("hw_sn", "")).strip() or None
-        tx.response_received = True
-        LOGGER.info(
-            "business hw result matched: asset_id=%s request_seq=%s request_id=%s hw_seq=%s hw_result=%s",
-            asset_id,
-            tx.request_seq,
-            tx.request_id,
-            tx.hw_seq,
-            tx.hw_result,
-        )
-        context.event.set()
+        self.transaction_manager.handle_frame(frame)
 
     def _on_status_changed(self, status: DeviceStatus) -> None:
         self._device_status = status
         if status == DeviceStatus.OFFLINE:
             LOGGER.warning("service observed device offline")
+            self._publish_device_status(status)
 
     def _finalize_transaction(self, tx: PendingTransaction) -> BusinessResult:
+        if tx.state != TransactionState.UPDATING:
+            return self._result_from_runtime_failure(tx)
+
         current_status = self.get_asset_status(tx.asset_id)
         if current_status is None:
-            tx.state = TransactionState.FAILED
+            tx = self.transaction_manager.mark_commit_failed(tx.asset_id, "资产不存在，无法提交业务结果")
             return self._build_result(
                 success=False,
                 code=ConfirmResult.ASSET_NOT_FOUND.value,
@@ -488,48 +251,10 @@ class AssetConfirmService:
                 hw_sn=tx.hw_sn,
                 state=tx.state,
             )
+
         hw_result = tx.hw_result or ConfirmResult.INTERNAL_ERROR.value
-        try:
-            confirm_result = ConfirmResult(hw_result)
-        except ValueError:
-            confirm_result = ConfirmResult.INTERNAL_ERROR
-
-        if confirm_result != ConfirmResult.CONFIRMED:
-            tx.state = TransactionState.FAILED
-            message_map = {
-                ConfirmResult.CANCELLED: "用户已在硬件端取消操作",
-                ConfirmResult.TIMEOUT: "用户在硬件端确认超时",
-                ConfirmResult.BUSY: "设备忙，请稍后重试",
-            }
-            message = message_map.get(confirm_result, "硬件返回未知结果")
-            LOGGER.warning(
-                "business failed by hw result: asset_id=%s action=%s request_seq=%s hw_seq=%s hw_result=%s",
-                tx.asset_id,
-                tx.action_type.value,
-                tx.request_seq,
-                tx.hw_seq,
-                hw_result,
-            )
-            return self._build_result(
-                success=False,
-                code=confirm_result.value,
-                message=message,
-                asset_id=tx.asset_id,
-                action_type=tx.action_type,
-                user_id=tx.user_id,
-                user_name=tx.user_name,
-                seq_id=tx.request_seq,
-                request_seq=tx.request_seq,
-                request_id=tx.request_id,
-                hw_seq=tx.hw_seq,
-                hw_result=hw_result,
-                hw_sn=tx.hw_sn,
-                state=tx.state,
-                extra={"asset_status": current_status.value},
-            )
-
         if tx.hw_seq is None:
-            tx.state = TransactionState.FAILED
+            tx = self.transaction_manager.mark_commit_failed(tx.asset_id, "缺少硬件序列号，拒绝提交业务结果")
             return self._build_result(
                 success=False,
                 code=ConfirmResult.INTERNAL_ERROR.value,
@@ -541,11 +266,12 @@ class AssetConfirmService:
                 seq_id=tx.request_seq,
                 request_seq=tx.request_seq,
                 request_id=tx.request_id,
+                hw_result=hw_result,
+                hw_sn=tx.hw_sn,
                 state=tx.state,
                 extra={"asset_status": current_status.value},
             )
 
-        tx.state = TransactionState.UPDATING
         record = OperationRecordInput(
             asset_id=tx.asset_id,
             user_id=tx.user_id,
@@ -563,7 +289,7 @@ class AssetConfirmService:
             new_status = self.repository.apply_operation_atomically(record)
         except LookupError as exc:
             self.repository.rollback_transaction(tx.asset_id, str(exc))
-            tx.state = TransactionState.FAILED
+            tx = self.transaction_manager.mark_commit_failed(tx.asset_id, str(exc))
             LOGGER.warning("business asset missing during commit: asset_id=%s reason=%s", tx.asset_id, exc)
             return self._build_result(
                 success=False,
@@ -583,7 +309,7 @@ class AssetConfirmService:
             )
         except ValueError as exc:
             self.repository.rollback_transaction(tx.asset_id, str(exc))
-            tx.state = TransactionState.FAILED
+            tx = self.transaction_manager.mark_commit_failed(tx.asset_id, str(exc))
             LOGGER.warning("business state validation failed during commit: asset_id=%s reason=%s", tx.asset_id, exc)
             return self._build_result(
                 success=False,
@@ -600,12 +326,12 @@ class AssetConfirmService:
                 hw_result=hw_result,
                 hw_sn=tx.hw_sn,
                 state=tx.state,
-                extra={"asset_status": self.get_asset_status(tx.asset_id).value},
+                extra=self._current_asset_status_extra(tx.asset_id),
             )
         except Exception as exc:
             LOGGER.exception("business atomic commit failed: asset_id=%s request_seq=%s", tx.asset_id, tx.request_seq)
             self.repository.rollback_transaction(tx.asset_id, str(exc))
-            tx.state = TransactionState.FAILED
+            tx = self.transaction_manager.mark_commit_failed(tx.asset_id, str(exc))
             return self._build_result(
                 success=False,
                 code=ConfirmResult.INTERNAL_ERROR.value,
@@ -621,10 +347,10 @@ class AssetConfirmService:
                 hw_result=hw_result,
                 hw_sn=tx.hw_sn,
                 state=tx.state,
-                extra={"asset_status": self.get_asset_status(tx.asset_id).value},
+                extra=self._current_asset_status_extra(tx.asset_id),
             )
 
-        tx.state = TransactionState.COMPLETED
+        tx = self.transaction_manager.mark_commit_success(tx.asset_id)
         LOGGER.info(
             "business success: asset_id=%s action=%s request_seq=%s request_id=%s hw_seq=%s",
             tx.asset_id,
@@ -650,6 +376,76 @@ class AssetConfirmService:
             hw_sn=tx.hw_sn,
             state=tx.state,
             extra={"asset_status": new_status.value},
+        )
+
+    def _result_from_runtime_failure(self, tx: PendingTransaction) -> BusinessResult:
+        if tx.response_received:
+            code = ConfirmResult.INTERNAL_ERROR.value
+            message = "硬件返回未知结果"
+            if tx.hw_result == ConfirmResult.CANCELLED.value:
+                code = ConfirmResult.CANCELLED.value
+                message = "用户已在硬件端取消操作"
+            elif tx.hw_result == ConfirmResult.TIMEOUT.value:
+                code = ConfirmResult.TIMEOUT.value
+                message = "用户在硬件端确认超时"
+            elif tx.hw_result == ConfirmResult.BUSY.value:
+                code = ConfirmResult.BUSY.value
+                message = "设备忙，请稍后重试"
+            return self._build_result(
+                success=False,
+                code=code,
+                message=message,
+                asset_id=tx.asset_id,
+                action_type=tx.action_type,
+                user_id=tx.user_id,
+                user_name=tx.user_name,
+                seq_id=tx.request_seq,
+                request_seq=tx.request_seq,
+                request_id=tx.request_id,
+                hw_seq=tx.hw_seq,
+                hw_result=tx.hw_result,
+                hw_sn=tx.hw_sn,
+                state=tx.state,
+                extra=self._current_asset_status_extra(tx.asset_id),
+            )
+
+        message = tx.error_message or "事务失败"
+        code = ConfirmResult.INTERNAL_ERROR.value
+        if message == "等待 EVT_USER_ACTION 超时":
+            code = ConfirmResult.HW_RESULT_TIMEOUT.value
+            message = "已收到 ACK，但等待硬件确认结果超时"
+        return self._build_result(
+            success=False,
+            code=code,
+            message=message,
+            asset_id=tx.asset_id,
+            action_type=tx.action_type,
+            user_id=tx.user_id,
+            user_name=tx.user_name,
+            seq_id=tx.request_seq,
+            request_seq=tx.request_seq,
+            request_id=tx.request_id,
+            hw_seq=tx.hw_seq,
+            hw_result=tx.hw_result,
+            hw_sn=tx.hw_sn,
+            state=tx.state,
+            extra=self._current_asset_status_extra(tx.asset_id),
+        )
+
+    def _rule_result_to_business_result(self, rule_result: Any, user_name: str) -> BusinessResult:
+        return self._build_result(
+            success=False,
+            code=rule_result.code,
+            message=rule_result.message,
+            asset_id=rule_result.asset_id,
+            action_type=rule_result.action_type,
+            user_id=rule_result.user_id,
+            user_name=user_name,
+            seq_id=-1,
+            request_seq=None,
+            request_id=None,
+            state=TransactionState.FAILED,
+            extra=dict(rule_result.extra),
         )
 
     def _result_from_send_failure(
@@ -691,6 +487,12 @@ class AssetConfirmService:
             extra={"asset_status": current_status.value},
         )
 
+    def _current_asset_status_extra(self, asset_id: str) -> dict[str, str]:
+        asset_status = self.get_asset_status(asset_id)
+        if asset_status is None:
+            return {}
+        return {"asset_status": asset_status.value}
+
     def _build_result(
         self,
         success: bool,
@@ -727,3 +529,70 @@ class AssetConfirmService:
             transaction_state=state,
             extra=extra or {},
         )
+
+    def _return_with_status(self, result: BusinessResult) -> BusinessResult:
+        self._publish_business_result(result)
+        return result
+
+    def _publish_pending_status(self, tx: PendingTransaction, code: str, message: str) -> None:
+        self._emit_status_payload(
+            {
+                "asset_id": tx.asset_id,
+                "action_type": tx.action_type.value,
+                "user_id": tx.user_id,
+                "user_name": tx.user_name,
+                "seq_id": tx.request_seq,
+                "request_seq": tx.request_seq,
+                "request_id": tx.request_id,
+                "hw_seq": tx.hw_seq,
+                "hw_result": tx.hw_result,
+                "hw_sn": tx.hw_sn,
+                "device_status": self.device_status.value,
+                "transaction_state": tx.state.value,
+                "code": code,
+                "message": message,
+                "success": None,
+                "extra": {},
+            }
+        )
+
+    def _publish_business_result(self, result: BusinessResult) -> None:
+        self._emit_status_payload(result.to_dict())
+
+    def _publish_device_status(self, status: DeviceStatus) -> None:
+        self._emit_status_payload(
+            {
+                "asset_id": None,
+                "action_type": None,
+                "user_id": None,
+                "user_name": None,
+                "seq_id": None,
+                "request_seq": None,
+                "request_id": None,
+                "hw_seq": None,
+                "hw_result": None,
+                "hw_sn": None,
+                "device_status": status.value,
+                "transaction_state": TransactionState.IDLE.value,
+                "code": ConfirmResult.DEVICE_OFFLINE.value,
+                "message": "设备离线",
+                "success": None,
+                "extra": {},
+            }
+        )
+
+    def _emit_status_payload(self, payload: dict[str, Any]) -> None:
+        callback = self._status_callback
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            LOGGER.warning(
+                "status callback failed: asset_id=%s action=%s request_seq=%s code=%s",
+                payload.get("asset_id"),
+                payload.get("action_type"),
+                payload.get("request_seq"),
+                payload.get("code"),
+                exc_info=True,
+            )

@@ -100,6 +100,7 @@ class MockMCUServer:
             LOGGER.info("mock mcu client connected: %s", address)
             self._reader_thread = threading.Thread(target=self._reader_loop, args=(client,), name="mock-mcu-reader", daemon=True)
             self._reader_thread.start()
+            self._send_heartbeat()
 
     def _reader_loop(self, client: socket.socket) -> None:
         parser = FrameParser()
@@ -119,6 +120,10 @@ class MockMCUServer:
         with self._client_lock:
             if self._client_socket is client:
                 self._client_socket = None
+        try:
+            client.close()
+        except OSError:
+            pass
         LOGGER.info("mock mcu client disconnected")
 
     def _heartbeat_loop(self) -> None:
@@ -129,13 +134,7 @@ class MockMCUServer:
             with self._client_lock:
                 if self._client_socket is None:
                     continue
-            self._send_frame(
-                Frame.build(
-                    msg_type=MsgType.EVT_HEARTBEAT,
-                    seq_id=self._next_seq(),
-                    payload={"hw_sn": "STM32F103-A23", "status": "OK"},
-                )
-            )
+            self._send_heartbeat()
 
     def _handle_parser_event(self, event: ParserEvent) -> None:
         if event.frame is not None:
@@ -247,6 +246,15 @@ class MockMCUServer:
         if self.mode == "duplicate_confirm":
             time.sleep(0.2)
             self._send_frame(Frame.build(MsgType.EVT_USER_ACTION, self._next_seq(), response_payload))
+
+    def _send_heartbeat(self) -> None:
+        self._send_frame(
+            Frame.build(
+                msg_type=MsgType.EVT_HEARTBEAT,
+                seq_id=self._next_seq(),
+                payload={"hw_sn": "STM32F103-A23", "status": "OK"},
+            )
+        )
 
     def _send_frame(self, frame: Frame) -> None:
         packet = encode_frame(frame)
