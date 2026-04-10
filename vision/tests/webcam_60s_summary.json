@@ -1,0 +1,60 @@
+{
+  "run_metadata": {
+    "run_mode": "live",
+    "source_type": "webcam",
+    "source_id": "webcam-0",
+    "started_at_epoch_sec": 1775790148.678755,
+    "ended_at_epoch_sec": 1775790209.2561197,
+    "uptime_sec": 60.57736539999314,
+    "soak_enabled": true,
+    "preview_requested": false,
+    "preview_active": false,
+    "preview_overlay_enabled": true,
+    "exported_paths": {},
+    "status": "submitted",
+    "ended_by": "soak_duration_reached",
+    "health_state": "STOPPED"
+  },
+  "summary_counters": {
+    "processed_frames": 294,
+    "submitted_frames": 20,
+    "skipped_frames": 222,
+    "failed_frames": 52,
+    "low_quality_count": 0,
+    "no_code_count": 49,
+    "parse_fail_count": 0,
+    "duplicate_count": 222,
+    "conflict_count": 0,
+    "submit_success_count": 20,
+    "submit_fail_count": 0,
+    "reconnect_attempt_count": 0,
+    "reconnect_success_count": 0,
+    "reconnect_fail_count": 0
+  },
+  "health_transitions": [
+    {
+      "timestamp": 1775790148.678771,
+      "to_state": "STARTING",
+      "reason": "runner_start",
+      "from_state": "STOPPED"
+    },
+    {
+      "timestamp": 1775790149.9089484,
+      "to_state": "RUNNING",
+      "reason": "capture_opened",
+      "from_state": "STARTING"
+    },
+    {
+      "timestamp": 1775790208.7919447,
+      "to_state": "STOPPING",
+      "reason": "soak_duration_reached",
+      "from_state": "RUNNING"
+    },
+    {
+      "timestamp": 1775790209.2561288,
+      "to_state": "STOPPED",
+      "reason": "soak_duration_reached",
+      "from_state": "STOPPING"
+    }
+  ]
+}

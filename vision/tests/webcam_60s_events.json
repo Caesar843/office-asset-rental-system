@@ -1,0 +1,639 @@
+{
+  "run_metadata": {
+    "run_mode": "live",
+    "source_type": "webcam",
+    "source_id": "webcam-0",
+    "started_at_epoch_sec": 1775790148.678755,
+    "ended_at_epoch_sec": 1775790209.2561197,
+    "uptime_sec": 60.57736539999314,
+    "soak_enabled": true,
+    "preview_requested": false,
+    "preview_active": false,
+    "preview_overlay_enabled": true,
+    "exported_paths": {},
+    "status": "submitted",
+    "ended_by": "soak_duration_reached",
+    "health_state": "STOPPED"
+  },
+  "health_transitions": [
+    {
+      "timestamp": 1775790148.678771,
+      "to_state": "STARTING",
+      "reason": "runner_start",
+      "from_state": "STOPPED"
+    },
+    {
+      "timestamp": 1775790149.9089484,
+      "to_state": "RUNNING",
+      "reason": "capture_opened",
+      "from_state": "STARTING"
+    },
+    {
+      "timestamp": 1775790208.7919447,
+      "to_state": "STOPPING",
+      "reason": "soak_duration_reached",
+      "from_state": "RUNNING"
+    },
+    {
+      "timestamp": 1775790209.2561288,
+      "to_state": "STOPPED",
+      "reason": "soak_duration_reached",
+      "from_state": "STOPPING"
+    }
+  ],
+  "recent_events": [
+    {
+      "timestamp": 1775790205.7994003,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-280",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790205.7994149,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-280",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790205.7994225,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-280",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790205.9969194,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-281",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790205.996931,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-281",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790205.9969366,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-281",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790206.1991234,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-282",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790206.1991384,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-282",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790206.1991456,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-282",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790206.3970962,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-283",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790206.3971102,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-283",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790206.3971174,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-283",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790206.596676,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-284",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790206.5966878,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-284",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790206.5966933,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-284",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790206.7993002,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-285",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790206.799317,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-285",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790206.7993238,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-285",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790207.0005276,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-286",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790207.000547,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-286",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790207.0005546,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-286",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790207.1990814,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-287",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790207.1990983,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-287",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790207.199106,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-287",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790207.4000716,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-288",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790207.4000852,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-288",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790207.4000907,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-288",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790207.5980573,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-289",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790207.5980725,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-289",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790207.5980809,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-289",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790207.799205,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-290",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790207.7992203,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-290",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790207.7992268,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-290",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790207.9978487,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-291",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790207.997866,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-291",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790207.9978724,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-291",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790208.206285,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-292",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790208.2063026,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-292",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790208.2063096,
+      "event_type": "parse_success",
+      "message": "scan result normalized successfully",
+      "frame_id": "webcam-0-292",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790208.2063174,
+      "event_type": "submit_success",
+      "message": "scan result accepted",
+      "frame_id": "webcam-0-292",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "code": "SCAN_ACCEPTED",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790208.3983338,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-293",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790208.3983464,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-293",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790208.398353,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-293",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790208.59892,
+      "event_type": "frame_captured",
+      "message": "frame captured",
+      "frame_id": "webcam-0-294",
+      "source_id": "webcam-0"
+    },
+    {
+      "timestamp": 1775790208.5989318,
+      "event_type": "decode_success",
+      "message": "decoder returned 1 result(s)",
+      "frame_id": "webcam-0-294",
+      "source_id": "webcam-0",
+      "code": "DECODE_OK",
+      "extra": {
+        "raw_texts": [
+          "AS-LIVE-001"
+        ],
+        "symbologies": [
+          "QR"
+        ]
+      }
+    },
+    {
+      "timestamp": 1775790208.598937,
+      "event_type": "dedup_duplicate",
+      "message": "scan result skipped as duplicate",
+      "frame_id": "webcam-0-294",
+      "source_id": "webcam-0",
+      "asset_id": "AS-LIVE-001",
+      "duplicate_reason": "within_dedup_window",
+      "extra": {
+        "raw_text": "AS-LIVE-001",
+        "symbology": "QR"
+      }
+    },
+    {
+      "timestamp": 1775790208.7917078,
+      "event_type": "soak_limit_reached",
+      "message": "soak duration reached 60s",
+      "source_id": "webcam-0",
+      "code": "SOAK_DURATION_REACHED",
+      "extra": {
+        "uptime_sec": 60.112946599998395
+      }
+    },
+    {
+      "timestamp": 1775790208.7919552,
+      "event_type": "health_transition",
+      "message": "health RUNNING -> STOPPING",
+      "source_id": "webcam-0",
+      "code": "HEALTH_STATE",
+      "extra": {
+        "from_state": "RUNNING",
+        "to_state": "STOPPING",
+        "reason": "soak_duration_reached"
+      }
+    },
+    {
+      "timestamp": 1775790209.2561495,
+      "event_type": "health_transition",
+      "message": "health STOPPING -> STOPPED",
+      "source_id": "webcam-0",
+      "code": "HEALTH_STATE",
+      "extra": {
+        "from_state": "STOPPING",
+        "to_state": "STOPPED",
+        "reason": "soak_duration_reached"
+      }
+    },
+    {
+      "timestamp": 1775790209.2581918,
+      "event_type": "summary_exported",
+      "message": "summary exported to tests\\webcam_60s_summary.json",
+      "source_id": "webcam-0",
+      "code": "SUMMARY_EXPORTED"
+    }
+  ]
+}
