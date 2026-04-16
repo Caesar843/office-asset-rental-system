@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import json
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 from app.config import VisionConfig
 from app.runner import LiveModeConfigurationError, LiveModeNotReadyError, PreviewUnavailableError, build_runner
@@ -21,6 +24,7 @@ from models.frame import FrameData
 from parser.stub import MockScanResultBuilder
 from tests._fixtures import blur_image, make_qr_image, remove_temp_file, save_temp_image, save_temp_video
 import app.runner as runner_module
+import main as main_module
 
 
 class _OpenFailsSource(FrameSource):
@@ -156,6 +160,32 @@ class _ReconnectFailSource(FrameSource):
     def reconnect(self) -> None:
         self.reconnect_calls += 1
         raise CaptureOpenError("reconnect failed")
+
+
+class _KeyboardInterruptSource(FrameSource):
+    def open(self) -> None:
+        return None
+
+    def read(self) -> FrameData:
+        raise KeyboardInterrupt()
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self._now = 0.0
+        self._wall = 1700000000.0
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def time(self) -> float:
+        return self._wall + self._now
+
+    def sleep(self, seconds: float) -> None:
+        self._now += float(seconds)
 
 
 class RunnerTests(unittest.TestCase):
@@ -460,6 +490,146 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.reconnect_fail_count, 2)
         self.assertEqual(result.ended_by, "capture_failure")
 
+    def test_runtime_max_frames_alias_reaches_natural_stop(self) -> None:
+        clock = _FakeClock()
+        config = VisionConfig.from_overrides(
+            capture={"fps_limit": 30},
+            runtime={
+                "run_mode": "mock",
+                "single_run": False,
+                "soak_enabled": True,
+                "max_frames": 3,
+            },
+        )
+        runner = build_runner(config, sleep_fn=clock.sleep, time_fn=clock.time, monotonic_fn=clock.monotonic)
+
+        result = runner.run()
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(result.ended_by, "soak_max_frames_reached")
+        self.assertEqual(result.processed_frames, 3)
+        self.assertEqual(result.run_metadata["max_frames"], 3)
+        self.assertIsNone(result.run_metadata["max_duration_sec"])
+
+    def test_runtime_max_duration_alias_reaches_natural_stop(self) -> None:
+        clock = _FakeClock()
+        config = VisionConfig.from_overrides(
+            capture={"fps_limit": 2},
+            runtime={
+                "run_mode": "mock",
+                "single_run": False,
+                "soak_enabled": True,
+                "max_duration_sec": 1,
+            },
+        )
+        runner = build_runner(config, sleep_fn=clock.sleep, time_fn=clock.time, monotonic_fn=clock.monotonic)
+
+        result = runner.run()
+
+        self.assertEqual(result.status, "submitted")
+        self.assertEqual(result.ended_by, "soak_duration_reached")
+        self.assertGreaterEqual(result.uptime_sec, 1.0)
+        self.assertEqual(result.run_metadata["max_duration_sec"], 1)
+
+    def test_keyboard_interrupt_path_returns_summary_ready_result(self) -> None:
+        config = VisionConfig.from_overrides(runtime={"run_mode": "mock", "single_run": False, "stop_on_error": False})
+        runner = build_runner(
+            config,
+            source=_KeyboardInterruptSource(),
+            decoder=StaticDecoder(results=[DecodeResult(raw_text="AS-INT", symbology="QR")]),
+            scan_result_builder=MockScanResultBuilder(asset_id="AS-INT"),
+        )
+
+        result = runner.run()
+
+        self.assertEqual(result.status, "stopped")
+        self.assertEqual(result.ended_by, "keyboard_interrupt")
+        self.assertEqual(result.health_state, "STOPPED")
+        self.assertIn("uptime_sec", result.run_metadata)
+        self.assertTrue(any(event["event_type"] == "runner_stopped" for event in result.recent_events))
+
+    def test_gateway_failure_breakdown_is_counted_without_mixing_transport_and_business(self) -> None:
+        frames = [
+            FrameData(frame_id="fail-1", image=make_qr_image("AS-5501"), timestamp=1700000200, source_id="cam-1"),
+            FrameData(frame_id="fail-2", image=make_qr_image("AS-5502"), timestamp=1700000205, source_id="cam-1"),
+        ]
+        responses = iter(
+            [
+                TransportResponse(
+                    status_code=200,
+                    body=json.dumps(
+                        {
+                            "success": False,
+                            "code": "BUSY",
+                            "message": "scanner busy",
+                            "asset_id": "AS-5601",
+                            "extra": {"queue_depth": 1},
+                        }
+                    ).encode("utf-8"),
+                ),
+                TimeoutError("socket timed out"),
+            ]
+        )
+
+        def transport(url, payload, timeout_sec, headers):
+            del url, payload, timeout_sec, headers
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        config = VisionConfig.from_overrides(
+            capture={"fps_limit": 30},
+            runtime={"run_mode": "mock", "single_run": False, "stop_on_error": False},
+        )
+        runner = build_runner(
+            config,
+            source=_FiniteFrameSource(frames),
+            decoder=StaticDecoder(results=[DecodeResult(raw_text="AS-5601", symbology="QR")]),
+            scan_result_builder=MockScanResultBuilder(asset_id="AS-5601"),
+            api_client=APIClient(config.gateway, transport=transport),
+            sleep_fn=lambda seconds: None,
+        )
+
+        result = runner.run()
+
+        self.assertEqual(result.processed_frames, 2)
+        self.assertEqual(result.submit_fail_count, 2)
+        self.assertEqual(result.business_fail_count, 1)
+        self.assertEqual(result.transport_fail_count, 1)
+        self.assertEqual(result.http_fail_count, 0)
+        self.assertEqual(result.protocol_fail_count, 0)
+
+    def test_main_summary_on_exit_can_be_disabled_without_affecting_submission(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with patch.object(main_module.logging, "basicConfig", lambda *args, **kwargs: None):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main_module.main(["--run-mode", "mock", "--no-summary-on-exit"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("submit success:", stdout.getvalue())
+        self.assertNotIn("frames processed=", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_main_default_summary_contains_runtime_and_gateway_lines(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with patch.object(main_module.logging, "basicConfig", lambda *args, **kwargs: None):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main_module.main(["--run-mode", "mock", "--max-frames", "2"])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn("runtime duration_sec=", output)
+        self.assertIn("frames processed=", output)
+        self.assertIn("classifiers low_quality=", output)
+        self.assertIn("gateway submit_success=", output)
+        self.assertIn("transport_fail=", output)
+        self.assertEqual("", stderr.getvalue())
+
     def test_summary_contains_recent_events_when_enabled(self) -> None:
         runner = build_runner(VisionConfig(), mock_asset_id="AS-RUN-009")
 
@@ -470,7 +640,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_preview_builder_gracefully_degrades_when_gui_unavailable(self) -> None:
         config = VisionConfig.from_overrides(runtime={"run_mode": "mock", "show_preview": True})
-        with unittest.mock.patch.object(
+        with patch.object(
             runner_module,
             "CV2PreviewRenderer",
             side_effect=PreviewUnavailableError("gui unavailable"),

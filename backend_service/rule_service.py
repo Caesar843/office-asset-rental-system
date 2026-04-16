@@ -5,13 +5,14 @@ from models import (
     ActionType,
     ConfirmResult,
     DeviceStatus,
+    InboundRuleCheckRequest,
     RuleCheckRequest,
     RuleCheckResult,
 )
 
 
 class RuleService:
-    def check_request(self, request: RuleCheckRequest) -> RuleCheckResult:
+    def check_request(self, request: RuleCheckRequest | InboundRuleCheckRequest) -> RuleCheckResult:
         action_check = self.check_action_type(request)
         if action_check is not None:
             return action_check
@@ -20,6 +21,14 @@ class RuleService:
             return self.check_borrow(request)
         if request.action_type == ActionType.RETURN:
             return self.check_return(request)
+        if request.action_type == ActionType.INBOUND:
+            if not isinstance(request, InboundRuleCheckRequest):
+                return self._failed(
+                    request=request,
+                    code=ConfirmResult.INTERNAL_ERROR.value,
+                    message="入库规则请求对象非法",
+                )
+            return self.check_inbound(request)
 
         return self._failed(
             request=request,
@@ -33,6 +42,20 @@ class RuleService:
     def check_return(self, request: RuleCheckRequest) -> RuleCheckResult:
         return self._run_common_checks(request)
 
+    def check_inbound(self, request: InboundRuleCheckRequest) -> RuleCheckResult:
+        for checker in (
+            self.check_device_status,
+            self.check_inbound_required_fields,
+            self.check_inbound_permission,
+            self.check_inbound_category,
+            self.check_pending_conflict,
+            self.check_inbound_asset_absent,
+        ):
+            result = checker(request)
+            if result is not None:
+                return result
+        return self._passed(request)
+
     def check_device_status(self, request: RuleCheckRequest) -> RuleCheckResult | None:
         if request.device_status != DeviceStatus.OFFLINE:
             return None
@@ -43,7 +66,7 @@ class RuleService:
         )
 
     def check_action_type(self, request: RuleCheckRequest) -> RuleCheckResult | None:
-        if request.action_type in (ActionType.BORROW, ActionType.RETURN):
+        if request.action_type in (ActionType.BORROW, ActionType.RETURN, ActionType.INBOUND):
             return None
         return self._failed(
             request=request,
@@ -83,6 +106,53 @@ class RuleService:
             code=ConfirmResult.BUSY.value,
             message="该资产已有待确认事务，请勿重复提交",
             extra=self._asset_status_extra(request),
+        )
+
+    def check_inbound_required_fields(self, request: InboundRuleCheckRequest) -> RuleCheckResult | None:
+        if not request.asset_id.strip():
+            return self._failed(request=request, code=ConfirmResult.PARAM_INVALID.value, message="asset_id 不能为空")
+        if not request.user_id.strip():
+            return self._failed(request=request, code=ConfirmResult.PARAM_INVALID.value, message="user_id 不能为空")
+        if not request.user_name.strip():
+            return self._failed(request=request, code=ConfirmResult.PARAM_INVALID.value, message="user_name 不能为空")
+        if not request.asset_name.strip():
+            return self._failed(request=request, code=ConfirmResult.PARAM_INVALID.value, message="asset_name 不能为空")
+        if not request.location.strip():
+            return self._failed(request=request, code=ConfirmResult.PARAM_INVALID.value, message="location 不能为空")
+        if request.category_id is not None and request.category_id <= 0:
+            return self._failed(
+                request=request,
+                code=ConfirmResult.PARAM_INVALID.value,
+                message="category_id 必须为正整数",
+            )
+        return None
+
+    def check_inbound_permission(self, request: InboundRuleCheckRequest) -> RuleCheckResult | None:
+        if request.has_inbound_permission:
+            return None
+        return self._failed(
+            request=request,
+            code=ConfirmResult.PERMISSION_DENIED.value,
+            message="只有管理员可发起入库",
+        )
+
+    def check_inbound_category(self, request: InboundRuleCheckRequest) -> RuleCheckResult | None:
+        if request.category_id is None or request.category_exists:
+            return None
+        return self._failed(
+            request=request,
+            code=ConfirmResult.PARAM_INVALID.value,
+            message=f"分类不存在: {request.category_id}",
+        )
+
+    def check_inbound_asset_absent(self, request: InboundRuleCheckRequest) -> RuleCheckResult | None:
+        if request.asset_status is None:
+            return None
+        return self._failed(
+            request=request,
+            code=ConfirmResult.STATE_INVALID.value,
+            message="资产已存在，不允许重复入库",
+            extra={"asset_status": request.asset_status.value},
         )
 
     def _run_common_checks(self, request: RuleCheckRequest) -> RuleCheckResult:

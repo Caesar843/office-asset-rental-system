@@ -12,7 +12,16 @@ from unittest.mock import patch
 
 from api_app import build_default_runtime
 from db_repository import SQLiteTransactionRepository
-from models import ActionType, AssetStatus, ConfirmResult, OperationRecordInput
+from models import (
+    ActionType,
+    AssetStatus,
+    BorrowRequestCreateInput,
+    BorrowRequestReviewInput,
+    BorrowRequestStatus,
+    ConfirmResult,
+    InboundCommitInput,
+    OperationRecordInput,
+)
 from protocol import Frame, MsgType
 from repository import InMemoryTransactionRepository
 from serial_manager import SendResult
@@ -196,6 +205,40 @@ class SQLiteTransactionRepositoryTests(unittest.TestCase):
             due_time=None,
         )
 
+    def _build_borrow_request(
+        self,
+        *,
+        request_id: str = "br-5001",
+        asset_id: str = "AS-5001",
+        user_id: str = "U-5001",
+        status: BorrowRequestStatus = BorrowRequestStatus.PENDING,
+    ) -> BorrowRequestCreateInput:
+        return BorrowRequestCreateInput(
+            request_id=request_id,
+            asset_id=asset_id,
+            applicant_user_id=user_id,
+            applicant_user_name="Tester",
+            reason="Need laptop",
+            status=status,
+            requested_at="2026-04-15 09:00:00",
+        )
+
+    def _build_inbound_commit(self, *, asset_id: str, user_id: str, category_id: int | None = 1) -> InboundCommitInput:
+        return InboundCommitInput(
+            asset_id=asset_id,
+            asset_name="New Laptop",
+            category_id=category_id,
+            location="Inbound Shelf",
+            user_id=user_id,
+            user_name="管理员",
+            request_seq=601,
+            request_id="req-6001",
+            hw_seq=0x80000041,
+            hw_result=ConfirmResult.CONFIRMED.value,
+            hw_sn="STM32F103-A23",
+            op_time="2026-04-15 11:00:00",
+        )
+
     def _fetch_one(self, sql: str, params: tuple = ()) -> sqlite3.Row | None:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
@@ -246,7 +289,10 @@ class SQLiteTransactionRepositoryTests(unittest.TestCase):
         self.assertTrue(probe.ready)
         self.assertEqual(probe.status, "ok")
         self.assertEqual(probe.backend, "sqlite")
-        self.assertEqual(probe.details["tables_present"], ["assets", "users", "categories", "operation_records"])
+        self.assertEqual(
+            probe.details["tables_present"],
+            ["assets", "users", "categories", "operation_records", "borrow_requests"],
+        )
         self.assertEqual(probe.details["missing_tables"], [])
         self.assertEqual(probe.details["operation_record_id_strategy"], "sqlite_manual_max_plus_one")
         self.assertTrue(probe.details["foreign_keys_enabled"])
@@ -275,6 +321,43 @@ class SQLiteTransactionRepositoryTests(unittest.TestCase):
         asset_row = self._fetch_one("SELECT status FROM assets WHERE qr_code = ?", ("AS-5001",))
         record_count = self._fetch_one("SELECT COUNT(*) AS count FROM operation_records")
         self.assertEqual(asset_row["status"], 0)
+        self.assertEqual(record_count["count"], 0)
+
+    def test_sqlite_repository_inbound_commit_creates_asset_and_record(self) -> None:
+        repository = SQLiteTransactionRepository(self.db_path)
+
+        new_status = repository.apply_inbound_atomically(
+            self._build_inbound_commit(asset_id="AS-6001", user_id="U-5001")
+        )
+
+        self.assertEqual(new_status, AssetStatus.IN_STOCK)
+        asset_row = self._fetch_one(
+            "SELECT asset_name, category_id, qr_code, status, location FROM assets WHERE qr_code = ?",
+            ("AS-6001",),
+        )
+        record_row = self._fetch_one(
+            "SELECT op_type, hw_seq, hw_result, due_time FROM operation_records WHERE op_id = 1"
+        )
+        self.assertEqual(asset_row["asset_name"], "New Laptop")
+        self.assertEqual(asset_row["category_id"], 1)
+        self.assertEqual(asset_row["status"], 0)
+        self.assertEqual(asset_row["location"], "Inbound Shelf")
+        self.assertEqual(record_row["op_type"], ActionType.INBOUND.value)
+        self.assertEqual(record_row["hw_seq"], str(0x80000041))
+        self.assertEqual(record_row["hw_result"], ConfirmResult.CONFIRMED.value)
+        self.assertIsNone(record_row["due_time"])
+
+    def test_sqlite_repository_inbound_rolls_back_when_record_insert_fails(self) -> None:
+        repository = FailingSQLiteTransactionRepository(self.db_path)
+
+        with self.assertRaises(RuntimeError):
+            repository.apply_inbound_atomically(
+                self._build_inbound_commit(asset_id="AS-6002", user_id="U-5001")
+            )
+
+        asset_row = self._fetch_one("SELECT qr_code FROM assets WHERE qr_code = ?", ("AS-6002",))
+        record_count = self._fetch_one("SELECT COUNT(*) AS count FROM operation_records")
+        self.assertIsNone(asset_row)
         self.assertEqual(record_count["count"], 0)
 
     def test_service_can_commit_to_sqlite_repository(self) -> None:

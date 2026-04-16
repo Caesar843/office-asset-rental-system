@@ -18,7 +18,11 @@ class ScanResultNormalizer:
             "decoder_name": decode_result.decoder_name,
             **decode_result.extra,
         }
-        extra = {key: value for key, value in extra.items() if value is not None}
+        extra = {
+            key: value
+            for key, value in extra.items()
+            if value is not None and not str(key).startswith("_")
+        }
         return ScanResult(
             asset_id=asset_id,
             raw_text=decode_result.raw_text,
@@ -56,6 +60,7 @@ class FormalScanResultBuilder(ScanResultBuilder):
                 message="decoder returned no results",
                 frame_id=frame.frame_id,
                 source_id=frame.source_id,
+                extra={"classifier": "no_code"},
             )
 
         normalized_candidates: list[tuple[str, DecodeResult, ScanResult]] = []
@@ -73,7 +78,10 @@ class FormalScanResultBuilder(ScanResultBuilder):
                 message="could not extract a formal asset_id from decoder output",
                 frame_id=frame.frame_id,
                 source_id=frame.source_id,
-                extra={"raw_texts": [item.raw_text for item in decode_results]},
+                extra={
+                    "classifier": "parse_fail",
+                    "raw_texts": [item.raw_text for item in decode_results],
+                },
             )
 
         asset_ids = {asset_id for asset_id, _, _ in normalized_candidates}
@@ -84,11 +92,18 @@ class FormalScanResultBuilder(ScanResultBuilder):
                 message="multiple different asset_id values were decoded from the same frame",
                 frame_id=frame.frame_id,
                 source_id=frame.source_id,
-                extra={"asset_ids": sorted(asset_ids)},
+                extra={
+                    "classifier": "conflict",
+                    "asset_ids": sorted(asset_ids),
+                },
             )
 
         chosen = max(
             normalized_candidates,
-            key=lambda item: ((item[1].confidence or 0.0), (item[1].bbox[2] * item[1].bbox[3]) if item[1].bbox else 0.0),
+            key=lambda item: (
+                -int(item[1].extra.get("decode_stage_rank", 10_000)),
+                (item[1].confidence or 0.0),
+                (item[1].bbox[2] * item[1].bbox[3]) if item[1].bbox else 0.0,
+            ),
         )[2]
         return self._deduplicator.apply(chosen)

@@ -30,7 +30,7 @@ class ScanResultDeduplicator:
             _FrameSeenEntry(frame_time=scan_result.frame_time, asset_ids=set()),
         )
         frame_entry.frame_time = max(frame_entry.frame_time, scan_result.frame_time)
-        if scan_result.asset_id in frame_entry.asset_ids:
+        if self._config.enable_same_frame_dedup and scan_result.asset_id in frame_entry.asset_ids:
             return replace(
                 scan_result,
                 is_duplicate=True,
@@ -39,7 +39,11 @@ class ScanResultDeduplicator:
 
         key = (scan_result.asset_id, scan_result.source_id)
         last_seen = self._recent_by_key.get(key)
-        if last_seen is not None and scan_result.frame_time <= last_seen + self._config.window_sec:
+        if (
+            self._config.enable_time_window_dedup
+            and last_seen is not None
+            and scan_result.frame_time <= last_seen + self._config.dedup_window_sec
+        ):
             frame_entry.asset_ids.add(scan_result.asset_id)
             return replace(
                 scan_result,
@@ -48,11 +52,12 @@ class ScanResultDeduplicator:
             )
 
         frame_entry.asset_ids.add(scan_result.asset_id)
-        self._recent_by_key[key] = scan_result.frame_time
+        if self._config.enable_time_window_dedup:
+            self._recent_by_key[key] = scan_result.frame_time
         return scan_result
 
     def _prune(self, current_frame_time: int) -> None:
-        min_allowed = current_frame_time - self._config.window_sec
+        min_allowed = current_frame_time - self._config.dedup_window_sec
         stale_keys = [key for key, seen_time in self._recent_by_key.items() if seen_time < min_allowed]
         for key in stale_keys:
             self._recent_by_key.pop(key, None)

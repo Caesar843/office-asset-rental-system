@@ -58,11 +58,35 @@ def _require_optional_text(value: str | None, field_name: str) -> str | None:
     return _require_text(value, field_name)
 
 
+def _normalize_section_overrides(
+    section_name: str,
+    values: dict[str, Any] | None,
+    *,
+    aliases: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    if not values:
+        return {}
+    normalized = dict(values)
+    alias_map = aliases or {}
+    for alias_name, canonical_name in alias_map.items():
+        if alias_name not in normalized:
+            continue
+        alias_value = normalized.pop(alias_name)
+        if canonical_name in normalized and normalized[canonical_name] != alias_value:
+            raise ValueError(
+                f"{section_name}.{alias_name} conflicts with {section_name}.{canonical_name}"
+            )
+        normalized[canonical_name] = alias_value
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class CaptureConfig:
     source_type: str = "webcam"
     source_value: int | str = 0
     source_id: str = "webcam-0"
+    frame_width: int | None = 1280
+    frame_height: int | None = 720
     fps_limit: int = 5
     connect_timeout_sec: float = 3.0
     reconnect_enabled: bool = True
@@ -84,6 +108,8 @@ class CaptureConfig:
         if isinstance(self.source_value, str):
             object.__setattr__(self, "source_value", _require_text(self.source_value, "source_value"))
         object.__setattr__(self, "source_id", _require_text(self.source_id, "source_id"))
+        object.__setattr__(self, "frame_width", _require_optional_int(self.frame_width, "frame_width", minimum=1))
+        object.__setattr__(self, "frame_height", _require_optional_int(self.frame_height, "frame_height", minimum=1))
         object.__setattr__(self, "fps_limit", _require_int(self.fps_limit, "fps_limit", minimum=1))
         object.__setattr__(
             self,
@@ -142,12 +168,15 @@ class PreprocessConfig:
     retry_contrast_alpha: float = 1.35
     enable_roi: bool = False
     roi: tuple[float, float, float, float] | None = None
+    roi_fallback_to_full_frame: bool = True
     laplacian_variance_threshold: float = 40.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "enable_quality_gate", _require_bool(self.enable_quality_gate, "enable_quality_gate"))
         object.__setattr__(self, "min_quality_score", _require_probability(self.min_quality_score, "min_quality_score"))
         object.__setattr__(self, "max_retry_count", _require_int(self.max_retry_count, "max_retry_count", minimum=0))
+        if self.max_retry_count > 1:
+            raise ValueError("max_retry_count must remain <= 1 in the staged single-retry pipeline")
         object.__setattr__(self, "enable_grayscale", _require_bool(self.enable_grayscale, "enable_grayscale"))
         object.__setattr__(
             self,
@@ -183,9 +212,30 @@ class PreprocessConfig:
             object.__setattr__(self, "roi", (x, y, width, height))
         object.__setattr__(
             self,
+            "roi_fallback_to_full_frame",
+            _require_bool(self.roi_fallback_to_full_frame, "roi_fallback_to_full_frame"),
+        )
+        object.__setattr__(
+            self,
             "laplacian_variance_threshold",
             _require_positive_number(self.laplacian_variance_threshold, "laplacian_variance_threshold"),
         )
+
+    @property
+    def enable_roi_crop(self) -> bool:
+        return self.enable_roi
+
+    @property
+    def roi_ratio(self) -> tuple[float, float, float, float] | None:
+        return self.roi
+
+    @property
+    def min_sharpness_score(self) -> float:
+        return self.laplacian_variance_threshold
+
+    @property
+    def allow_one_retry_enhance(self) -> bool:
+        return self.retry_with_enhancement and self.max_retry_count > 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,14 +272,29 @@ class DecodeConfig:
 
 @dataclass(frozen=True, slots=True)
 class DedupConfig:
-    window_sec: int = 2
+    enable_same_frame_dedup: bool = True
+    enable_time_window_dedup: bool = True
+    dedup_window_sec: int = 2
+    window_sec: int | None = None
     key_fields: tuple[str, str] = ("asset_id", "source_id")
     time_field: str = "frame_time"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "window_sec", _require_int(self.window_sec, "window_sec", minimum=1))
-        if self.window_sec != 2:
-            raise ValueError("window_sec is a frozen V1 contract field and must remain 2")
+        object.__setattr__(
+            self,
+            "enable_same_frame_dedup",
+            _require_bool(self.enable_same_frame_dedup, "enable_same_frame_dedup"),
+        )
+        object.__setattr__(
+            self,
+            "enable_time_window_dedup",
+            _require_bool(self.enable_time_window_dedup, "enable_time_window_dedup"),
+        )
+        if self.window_sec is not None and self.dedup_window_sec != 2 and self.window_sec != self.dedup_window_sec:
+            raise ValueError("window_sec conflicts with dedup_window_sec")
+        window_value = self.window_sec if self.window_sec is not None else self.dedup_window_sec
+        object.__setattr__(self, "dedup_window_sec", _require_int(window_value, "dedup_window_sec", minimum=1))
+        object.__setattr__(self, "window_sec", self.dedup_window_sec)
         if tuple(self.key_fields) != ("asset_id", "source_id"):
             raise ValueError("key_fields is a frozen V1 contract field and must remain ('asset_id', 'source_id')")
         if self.time_field != "frame_time":
@@ -241,6 +306,7 @@ class GatewayConfig:
     base_url: str = "http://127.0.0.1:8000"
     scan_result_path: str = "/scan/result"
     request_timeout_sec: float = 5.0
+    strict_response_validation: bool = True
     user_agent: str = "vision-client/0.1"
 
     def __post_init__(self) -> None:
@@ -259,6 +325,11 @@ class GatewayConfig:
             "request_timeout_sec",
             _require_positive_number(self.request_timeout_sec, "request_timeout_sec"),
         )
+        object.__setattr__(
+            self,
+            "strict_response_validation",
+            _require_bool(self.strict_response_validation, "strict_response_validation"),
+        )
         object.__setattr__(self, "user_agent", _require_text(self.user_agent, "user_agent"))
 
 
@@ -268,6 +339,7 @@ class RuntimeConfig:
     single_run: bool = True
     log_level: str = "INFO"
     stop_on_error: bool = True
+    summary_on_exit: bool = True
     show_preview: bool = False
     debug_mode: bool = False
     preview_exit_key: str = "q"
@@ -275,6 +347,8 @@ class RuntimeConfig:
     preview_graceful_degrade: bool = True
     summary_include_recent_events: bool = True
     soak_enabled: bool = False
+    max_duration_sec: int | None = None
+    max_frames: int | None = None
     soak_duration_sec: int | None = None
     soak_max_frames: int | None = None
     summary_json_path: str | None = None
@@ -294,6 +368,7 @@ class RuntimeConfig:
             raise ValueError(f"unsupported log_level: {log_level}")
         object.__setattr__(self, "log_level", log_level)
         object.__setattr__(self, "stop_on_error", _require_bool(self.stop_on_error, "stop_on_error"))
+        object.__setattr__(self, "summary_on_exit", _require_bool(self.summary_on_exit, "summary_on_exit"))
         object.__setattr__(self, "show_preview", _require_bool(self.show_preview, "show_preview"))
         object.__setattr__(self, "debug_mode", _require_bool(self.debug_mode, "debug_mode"))
         preview_exit_key = _require_text(self.preview_exit_key, "preview_exit_key")
@@ -318,20 +393,32 @@ class RuntimeConfig:
         object.__setattr__(self, "soak_enabled", _require_bool(self.soak_enabled, "soak_enabled"))
         object.__setattr__(
             self,
-            "soak_duration_sec",
-            _require_optional_int(self.soak_duration_sec, "soak_duration_sec", minimum=1),
+            "max_duration_sec",
+            _require_optional_int(self.max_duration_sec, "max_duration_sec", minimum=1),
         )
         object.__setattr__(
             self,
-            "soak_max_frames",
-            _require_optional_int(self.soak_max_frames, "soak_max_frames", minimum=1),
+            "max_frames",
+            _require_optional_int(self.max_frames, "max_frames", minimum=1),
         )
-        if not self.soak_enabled and (self.soak_duration_sec is not None or self.soak_max_frames is not None):
-            raise ValueError("soak_duration_sec/soak_max_frames require soak_enabled=True")
+        soak_duration_sec = _require_optional_int(self.soak_duration_sec, "soak_duration_sec", minimum=1)
+        soak_max_frames = _require_optional_int(self.soak_max_frames, "soak_max_frames", minimum=1)
+        if soak_duration_sec is not None and self.max_duration_sec is not None and soak_duration_sec != self.max_duration_sec:
+            raise ValueError("soak_duration_sec conflicts with max_duration_sec")
+        if soak_max_frames is not None and self.max_frames is not None and soak_max_frames != self.max_frames:
+            raise ValueError("soak_max_frames conflicts with max_frames")
+        effective_duration = self.max_duration_sec if self.max_duration_sec is not None else soak_duration_sec
+        effective_frames = self.max_frames if self.max_frames is not None else soak_max_frames
+        object.__setattr__(self, "max_duration_sec", effective_duration)
+        object.__setattr__(self, "max_frames", effective_frames)
+        object.__setattr__(self, "soak_duration_sec", effective_duration)
+        object.__setattr__(self, "soak_max_frames", effective_frames)
+        if not self.soak_enabled and (effective_duration is not None or effective_frames is not None):
+            raise ValueError("max_duration_sec/max_frames require soak_enabled=True")
         if self.soak_enabled and self.single_run:
             raise ValueError("soak_enabled requires single_run=False")
-        if self.soak_enabled and self.soak_duration_sec is None and self.soak_max_frames is None:
-            raise ValueError("soak_enabled requires soak_duration_sec or soak_max_frames")
+        if self.soak_enabled and effective_duration is None and effective_frames is None:
+            raise ValueError("soak_enabled requires max_duration_sec or max_frames")
         object.__setattr__(
             self,
             "summary_json_path",
@@ -357,6 +444,14 @@ class RuntimeConfig:
             _require_bool(self.preview_overlay_enabled, "preview_overlay_enabled"),
         )
 
+    @property
+    def debug(self) -> bool:
+        return self.debug_mode
+
+    @property
+    def dry_run(self) -> bool:
+        return self.run_mode == "mock"
+
 
 @dataclass(frozen=True, slots=True)
 class VisionConfig:
@@ -378,13 +473,41 @@ class VisionConfig:
         gateway: dict[str, Any] | None = None,
         runtime: dict[str, Any] | None = None,
     ) -> VisionConfig:
+        normalized_preprocess = _normalize_section_overrides(
+            "preprocess",
+            preprocess,
+            aliases={
+                "enable_roi_crop": "enable_roi",
+                "roi_ratio": "roi",
+                "min_sharpness_score": "laplacian_variance_threshold",
+                "allow_one_retry_enhance": "retry_with_enhancement",
+            },
+        )
+        normalized_runtime = _normalize_section_overrides(
+            "runtime",
+            runtime,
+            aliases={"debug": "debug_mode"},
+        )
+        if "dry_run" in (runtime or {}):
+            dry_run = normalized_runtime.pop("dry_run")
+            if not isinstance(dry_run, bool):
+                raise TypeError("runtime.dry_run must be a bool")
+            run_mode = "mock" if dry_run else "live"
+            if "run_mode" in normalized_runtime and normalized_runtime["run_mode"] != run_mode:
+                raise ValueError("runtime.dry_run conflicts with runtime.run_mode")
+            normalized_runtime["run_mode"] = run_mode
+        normalized_dedup = _normalize_section_overrides(
+            "dedup",
+            dedup,
+            aliases={"window_sec": "dedup_window_sec"},
+        )
         return cls(
             capture=CaptureConfig(**(capture or {})),
-            preprocess=PreprocessConfig(**(preprocess or {})),
+            preprocess=PreprocessConfig(**normalized_preprocess),
             decode=DecodeConfig(**(decode or {})),
-            dedup=DedupConfig(**(dedup or {})),
+            dedup=DedupConfig(**normalized_dedup),
             gateway=GatewayConfig(**(gateway or {})),
-            runtime=RuntimeConfig(**(runtime or {})),
+            runtime=RuntimeConfig(**normalized_runtime),
         )
 
     def to_dict(self) -> dict[str, Any]:

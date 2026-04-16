@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from models import ActionType, AssetStatus, ConfirmResult, DeviceStatus, RuleCheckRequest
+from models import (
+    ActionType,
+    AssetStatus,
+    ConfirmResult,
+    DeviceStatus,
+    InboundRuleCheckRequest,
+    RuleCheckRequest,
+)
 from rule_service import RuleService
 
 
@@ -26,6 +33,34 @@ class RuleServiceTests(unittest.TestCase):
             device_status=device_status,
             asset_status=asset_status,
             has_pending_transaction=has_pending_transaction,
+        )
+
+    def build_inbound_request(
+        self,
+        *,
+        asset_status: AssetStatus | None,
+        user_id: str = "U-ADMIN",
+        device_status: DeviceStatus = DeviceStatus.ONLINE,
+        has_pending_transaction: bool = False,
+        asset_name: str = "ThinkPad X1",
+        category_id: int | None = 1,
+        location: str = "Rack A",
+        has_inbound_permission: bool = True,
+        category_exists: bool = True,
+    ) -> InboundRuleCheckRequest:
+        return InboundRuleCheckRequest(
+            asset_id="AS-9001",
+            user_id=user_id,
+            user_name="管理员",
+            action_type=ActionType.INBOUND,
+            device_status=device_status,
+            asset_status=asset_status,
+            has_pending_transaction=has_pending_transaction,
+            asset_name=asset_name,
+            category_id=category_id,
+            location=location,
+            has_inbound_permission=has_inbound_permission,
+            category_exists=category_exists,
         )
 
     def test_offline_device_blocks_borrow(self) -> None:
@@ -95,6 +130,44 @@ class RuleServiceTests(unittest.TestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+
+    def test_valid_inbound_passes(self) -> None:
+        result = self.rule_service.check_request(self.build_inbound_request(asset_status=None))
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+
+    def test_inbound_requires_admin_permission(self) -> None:
+        result = self.rule_service.check_request(
+            self.build_inbound_request(asset_status=None, has_inbound_permission=False, user_id="U-1001")
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.code, ConfirmResult.PERMISSION_DENIED.value)
+
+    def test_inbound_requires_asset_name(self) -> None:
+        result = self.rule_service.check_request(
+            self.build_inbound_request(asset_status=None, asset_name="")
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.code, ConfirmResult.PARAM_INVALID.value)
+
+    def test_inbound_rejects_existing_asset(self) -> None:
+        result = self.rule_service.check_request(
+            self.build_inbound_request(asset_status=AssetStatus.IN_STOCK)
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.code, ConfirmResult.STATE_INVALID.value)
+
+    def test_inbound_rejects_invalid_category(self) -> None:
+        result = self.rule_service.check_request(
+            self.build_inbound_request(asset_status=None, category_exists=False, category_id=9)
+        )
+
+        self.assertFalse(result.passed)
+        self.assertEqual(result.code, ConfirmResult.PARAM_INVALID.value)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime, timedelta
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -13,7 +16,8 @@ import serial_manager as serial_runtime
 from fastapi.testclient import TestClient
 
 from api_app import ApiRuntime, build_default_runtime, build_status_callback, create_app
-from models import ActionType, AssetStatus, ConfirmResult, DeviceStatus
+from db_repository import SQLiteTransactionRepository
+from models import ActionType, AssetStatus, ConfirmResult, DeviceStatus, OperationRecordInput
 from mock_mcu import MockMCUServer
 from protocol import Frame, MsgType
 from repository import InMemoryTransactionRepository
@@ -93,7 +97,7 @@ class FakeSerialManager:
 
 
 class FailingCommitRepository:
-    def __init__(self, *, asset_id: str, initial_status: AssetStatus, failure: Exception) -> None:
+    def __init__(self, *, asset_id: str, initial_status: AssetStatus | None, failure: Exception) -> None:
         self._asset_id = asset_id
         self._asset_status: AssetStatus | None = initial_status
         self._failure = failure
@@ -106,6 +110,12 @@ class FailingCommitRepository:
 
     def apply_operation_atomically(self, record):
         raise self._failure
+
+    def apply_inbound_atomically(self, commit):
+        raise self._failure
+
+    def category_exists(self, category_id: int) -> bool:
+        return True
 
     def rollback_transaction(self, asset_id: str, reason: str) -> None:
         self.rollback_calls.append((asset_id, reason))
@@ -169,6 +179,30 @@ class ApiAppTests(unittest.TestCase):
                 "hw_sn": "STM32F103-A23",
             },
         )
+
+    def build_operation_record(
+        self,
+        *,
+        asset_id: str,
+        user_id: str,
+        action_type: ActionType,
+        request_seq: int,
+    ) -> OperationRecordInput:
+        return OperationRecordInput(
+            asset_id=asset_id,
+            user_id=user_id,
+            user_name="Dashboard Tester",
+            action_type=action_type,
+            request_seq=request_seq,
+            request_id=f"req-{request_seq}",
+            hw_seq=0x80000000 + request_seq,
+            hw_result=ConfirmResult.CONFIRMED.value,
+            hw_sn="STM32F103-A23",
+            due_time=None,
+        )
+
+    def decode_csv_body(self, response) -> str:
+        return response.content.decode("utf-8-sig")
 
     def test_health_returns_device_status_and_serial_state(self) -> None:
         runtime = self.build_runtime(
@@ -326,7 +360,7 @@ class ApiAppTests(unittest.TestCase):
         self.assertTrue(response.json()["success"])
         self.assertEqual(response.json()["transaction_state"], "COMPLETED")
 
-    def test_get_asset_returns_actions_and_scan_result_is_placeholder_only(self) -> None:
+    def test_get_asset_returns_actions_and_scan_result_matches_vision_contract(self) -> None:
         runtime = self.build_runtime(
             serial_manager=FakeSerialManager(),
             initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED},
@@ -344,10 +378,1593 @@ class ApiAppTests(unittest.TestCase):
         scan_payload = scan_response.json()
         self.assertEqual(
             set(scan_payload.keys()),
-            {"asset_id", "exists", "asset_status", "device_status"},
+            {"success", "code", "message", "asset_id", "extra"},
         )
-        self.assertEqual(scan_payload["asset_status"], AssetStatus.BORROWED.value)
+        self.assertTrue(scan_payload["success"])
+        self.assertEqual(scan_payload["code"], "SCAN_ACCEPTED")
+        self.assertTrue(scan_payload["message"])
+        self.assertEqual(scan_payload["asset_id"], "AS-1002")
+        self.assertEqual(
+            scan_payload["extra"],
+            {
+                "exists": True,
+                "asset_status": AssetStatus.BORROWED.value,
+                "device_status": DeviceStatus.ONLINE.value,
+            },
+        )
         self.assertFalse(missing_response.json()["exists"])
+
+    def test_get_assets_returns_frontend_asset_status_map(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/assets")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "AS-1001": AssetStatus.IN_STOCK.value,
+                "AS-1002": AssetStatus.BORROWED.value,
+            },
+        )
+
+    def test_frontend_home_contains_inbound_tab_and_binding_hooks(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+        for snippet in (
+            'data-tab="inbound"',
+            'id="inbound-asset-id"',
+            'id="inbound-asset-name"',
+            'id="inbound-category-id"',
+            'id="inbound-location"',
+            'id="inbound-user-id"',
+            'id="inbound-user-name"',
+            'id="inbound-scan-status"',
+            'onclick="submitInbound()"',
+            'bindScanResultToInbound',
+            'refreshInboundRelatedViews',
+        ):
+            self.assertIn(snippet, html)
+
+    def test_frontend_home_contains_borrow_request_and_approval_hooks(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+        for snippet in (
+            'setupBorrowRequestPages',
+            'submitBorrowRequest',
+            'loadBorrowRequests',
+            'approveBorrowRequest',
+            'rejectBorrowRequest',
+            'startBorrowFromRequest',
+            '/borrow-requests',
+            '/start-borrow',
+            'data-tab="borrow"',
+        ):
+            self.assertIn(snippet, html)
+
+    def test_scan_result_remains_separate_from_inbound_transaction_creation(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={})
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            scan_response = client.post("/scan/result", json={"asset_id": "AS-IN-NEW"})
+            assets_response = client.get("/assets")
+            records_response = client.get("/records?action_type=INBOUND&time_range=all")
+
+        self.assertEqual(scan_response.status_code, 200)
+        self.assertEqual(scan_response.json()["code"], "ASSET_NOT_FOUND")
+        self.assertEqual(scan_response.json()["asset_id"], "AS-IN-NEW")
+        self.assertEqual(assets_response.json(), {})
+        self.assertEqual(records_response.json()["total"], 0)
+        self.assertEqual(repository.records, [])
+
+    def test_borrow_request_api_create_approve_start_and_list_flow(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-BR-1001": AssetStatus.IN_STOCK})
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            ),
+            repository=repository,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1001",
+                    "user_id": "U-BR-1001",
+                    "user_name": "Borrow User",
+                    "reason": "Project demo",
+                },
+            )
+            request_id = create_response.json()["item"]["request_id"]
+            pending_response = client.get("/borrow-requests?status=PENDING&asset_id=AS-BR-1001")
+            approve_response = client.post(
+                f"/borrow-requests/{request_id}/approve",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "approved",
+                },
+            )
+            approved_response = client.get("/borrow-requests?status=APPROVED&applicant_user_id=U-BR-1001")
+            start_response = client.post(
+                f"/borrow-requests/{request_id}/start-borrow",
+                json={"timeout_ms": 300},
+            )
+            consumed_response = client.get("/borrow-requests?status=CONSUMED&asset_id=AS-BR-1001")
+            assets_response = client.get("/assets")
+
+        self.assertEqual(create_response.status_code, 200)
+        self.assertEqual(create_response.json()["code"], "REQUEST_CREATED")
+        self.assertEqual(create_response.json()["item"]["status"], "PENDING")
+        self.assertEqual(pending_response.status_code, 200)
+        self.assertEqual(pending_response.json()["total"], 1)
+        self.assertEqual(pending_response.json()["items"][0]["request_id"], request_id)
+        self.assertEqual(approve_response.status_code, 200)
+        self.assertEqual(approve_response.json()["code"], "REQUEST_APPROVED")
+        self.assertEqual(approve_response.json()["item"]["status"], "APPROVED")
+        self.assertEqual(approved_response.status_code, 200)
+        self.assertEqual(approved_response.json()["total"], 1)
+        self.assertEqual(approved_response.json()["items"][0]["request_id"], request_id)
+        self.assertEqual(start_response.status_code, 200)
+        self.assertTrue(start_response.json()["success"])
+        self.assertEqual(start_response.json()["code"], ConfirmResult.CONFIRMED.value)
+        self.assertEqual(start_response.json()["extra"]["borrow_request_id"], request_id)
+        self.assertEqual(consumed_response.status_code, 200)
+        self.assertEqual(consumed_response.json()["total"], 1)
+        self.assertEqual(consumed_response.json()["items"][0]["status"], "CONSUMED")
+        self.assertEqual(assets_response.json()["AS-BR-1001"], AssetStatus.BORROWED.value)
+
+    def test_borrow_request_api_non_admin_cannot_approve_and_request_stays_pending(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-BR-1003": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1003",
+                    "user_id": "U-BR-1003",
+                    "user_name": "Borrow User",
+                    "reason": "Project demo",
+                },
+            )
+            request_id = create_response.json()["item"]["request_id"]
+            approve_response = client.post(
+                f"/borrow-requests/{request_id}/approve",
+                json={
+                    "reviewer_user_id": "U-NORMAL",
+                    "reviewer_user_name": "Normal User",
+                    "review_comment": "not allowed",
+                },
+            )
+            pending_response = client.get("/borrow-requests?status=PENDING&asset_id=AS-BR-1003")
+
+        self.assertEqual(approve_response.status_code, 200)
+        self.assertFalse(approve_response.json()["success"])
+        self.assertEqual(approve_response.json()["code"], ConfirmResult.PERMISSION_DENIED.value)
+        self.assertEqual(pending_response.status_code, 200)
+        self.assertEqual(pending_response.json()["total"], 1)
+        self.assertEqual(pending_response.json()["items"][0]["request_id"], request_id)
+        self.assertEqual(pending_response.json()["items"][0]["status"], "PENDING")
+
+    def test_borrow_request_api_reject_and_repeat_review_are_blocked(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-BR-1004": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1004",
+                    "user_id": "U-BR-1004",
+                    "user_name": "Borrow User",
+                    "reason": "Project demo",
+                },
+            )
+            request_id = create_response.json()["item"]["request_id"]
+            reject_response = client.post(
+                f"/borrow-requests/{request_id}/reject",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "rejected",
+                },
+            )
+            repeat_review_response = client.post(
+                f"/borrow-requests/{request_id}/approve",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "second review",
+                },
+            )
+            rejected_response = client.get("/borrow-requests?status=REJECTED&asset_id=AS-BR-1004")
+
+        self.assertEqual(reject_response.status_code, 200)
+        self.assertTrue(reject_response.json()["success"])
+        self.assertEqual(reject_response.json()["code"], "REQUEST_REJECTED")
+        self.assertEqual(reject_response.json()["item"]["status"], "REJECTED")
+        self.assertEqual(repeat_review_response.status_code, 200)
+        self.assertFalse(repeat_review_response.json()["success"])
+        self.assertEqual(repeat_review_response.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(repeat_review_response.json()["item"]["status"], "REJECTED")
+        self.assertEqual(rejected_response.status_code, 200)
+        self.assertEqual(rejected_response.json()["total"], 1)
+        self.assertEqual(rejected_response.json()["items"][0]["status"], "REJECTED")
+
+    def test_borrow_request_api_only_approved_can_start_borrow(self) -> None:
+        approved_runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            ),
+            initial_assets={"AS-BR-1005": AssetStatus.IN_STOCK, "AS-BR-1006": AssetStatus.IN_STOCK},
+        )
+        approved_app = create_app(approved_runtime)
+
+        with TestClient(approved_app) as client:
+            pending_create = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1005",
+                    "user_id": "U-BR-1005",
+                    "user_name": "Borrow User",
+                    "reason": "pending path",
+                },
+            )
+            pending_request_id = pending_create.json()["item"]["request_id"]
+            pending_start = client.post(
+                f"/borrow-requests/{pending_request_id}/start-borrow",
+                json={"timeout_ms": 300},
+            )
+
+            rejected_create = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1006",
+                    "user_id": "U-BR-1006",
+                    "user_name": "Borrow User",
+                    "reason": "rejected path",
+                },
+            )
+            rejected_request_id = rejected_create.json()["item"]["request_id"]
+            client.post(
+                f"/borrow-requests/{rejected_request_id}/reject",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "rejected",
+                },
+            )
+            rejected_start = client.post(
+                f"/borrow-requests/{rejected_request_id}/start-borrow",
+                json={"timeout_ms": 300},
+            )
+
+        self.assertEqual(pending_start.status_code, 200)
+        self.assertFalse(pending_start.json()["success"])
+        self.assertEqual(pending_start.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(pending_start.json()["extra"]["borrow_request_id"], pending_request_id)
+        self.assertEqual(pending_start.json()["extra"]["borrow_request_status"], "PENDING")
+        self.assertEqual(rejected_start.status_code, 200)
+        self.assertFalse(rejected_start.json()["success"])
+        self.assertEqual(rejected_start.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(rejected_start.json()["extra"]["borrow_request_id"], rejected_request_id)
+        self.assertEqual(rejected_start.json()["extra"]["borrow_request_status"], "REJECTED")
+
+    def test_borrow_request_api_consumed_request_cannot_start_borrow_again(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            ),
+            initial_assets={"AS-BR-1007": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1007",
+                    "user_id": "U-BR-1007",
+                    "user_name": "Borrow User",
+                    "reason": "consume path",
+                },
+            )
+            request_id = create_response.json()["item"]["request_id"]
+            client.post(
+                f"/borrow-requests/{request_id}/approve",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "approved",
+                },
+            )
+            first_start = client.post(
+                f"/borrow-requests/{request_id}/start-borrow",
+                json={"timeout_ms": 300},
+            )
+            second_start = client.post(
+                f"/borrow-requests/{request_id}/start-borrow",
+                json={"timeout_ms": 300},
+            )
+
+        self.assertEqual(first_start.status_code, 200)
+        self.assertTrue(first_start.json()["success"])
+        self.assertEqual(second_start.status_code, 200)
+        self.assertFalse(second_start.json()["success"])
+        self.assertEqual(second_start.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(second_start.json()["extra"]["borrow_request_id"], request_id)
+        self.assertEqual(second_start.json()["extra"]["borrow_request_status"], "CONSUMED")
+
+    def test_borrow_request_api_start_borrow_failure_does_not_consume_request(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-BR-1008": AssetStatus.IN_STOCK})
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CANCELLED.value,
+                )
+            ),
+            repository=repository,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1008",
+                    "user_id": "U-BR-1008",
+                    "user_name": "Borrow User",
+                    "reason": "failure path",
+                },
+            )
+            request_id = create_response.json()["item"]["request_id"]
+            client.post(
+                f"/borrow-requests/{request_id}/approve",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "approved",
+                },
+            )
+            start_response = client.post(
+                f"/borrow-requests/{request_id}/start-borrow",
+                json={"timeout_ms": 300},
+            )
+            approved_response = client.get("/borrow-requests?status=APPROVED&asset_id=AS-BR-1008")
+            assets_response = client.get("/assets")
+
+        self.assertEqual(start_response.status_code, 200)
+        self.assertFalse(start_response.json()["success"])
+        self.assertEqual(start_response.json()["code"], ConfirmResult.CANCELLED.value)
+        self.assertEqual(start_response.json()["extra"]["borrow_request_id"], request_id)
+        self.assertEqual(approved_response.status_code, 200)
+        self.assertEqual(approved_response.json()["total"], 1)
+        self.assertEqual(approved_response.json()["items"][0]["status"], "APPROVED")
+        self.assertEqual(assets_response.json()["AS-BR-1008"], AssetStatus.IN_STOCK.value)
+        self.assertEqual(len(repository.records), 0)
+
+    def test_borrow_request_api_create_is_blocked_by_pending_transaction(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-BR-1002": AssetStatus.IN_STOCK},
+        )
+        runtime.service.transaction_manager.create_transaction(
+            asset_id="AS-BR-1002",
+            user_id="U-OTHER",
+            user_name="Other User",
+            action_type=ActionType.BORROW,
+            request_id="req-pending-api",
+            request_seq=701,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1002",
+                    "user_id": "U-BR-1002",
+                    "user_name": "Borrow User",
+                    "reason": "Need asset",
+                },
+            )
+            list_response = client.get("/borrow-requests?asset_id=AS-BR-1002")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], ConfirmResult.BUSY.value)
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.json()["total"], 0)
+
+    def test_dashboard_returns_summary_operation_stats_and_top_assets(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={
+                "AS-1001": AssetStatus.IN_STOCK,
+                "AS-1002": AssetStatus.BORROWED,
+                "AS-1003": AssetStatus.MAINTENANCE,
+                "AS-1004": AssetStatus.SCRAPPED,
+            }
+        )
+        repository.records.extend(
+            [
+                self.build_operation_record(
+                    asset_id="AS-1002",
+                    user_id="U-1001",
+                    action_type=ActionType.BORROW,
+                    request_seq=1,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-1002",
+                    user_id="U-1002",
+                    action_type=ActionType.BORROW,
+                    request_seq=2,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-1001",
+                    user_id="U-1003",
+                    action_type=ActionType.RETURN,
+                    request_seq=3,
+                ),
+            ]
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/dashboard")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["filters"], {"time_range": "all", "category": None})
+        self.assertEqual(
+            payload["summary"],
+            {
+                "in_stock": 1,
+                "borrowed": 1,
+                "maintenance": 1,
+                "scrapped": 1,
+            },
+        )
+        self.assertEqual(
+            payload["operation_stats"],
+            {
+                "borrow_count": 2,
+                "return_count": 1,
+            },
+        )
+        self.assertEqual(payload["borrow_top_assets"], [{"asset_id": "AS-1002", "count": 2}])
+        self.assertEqual(payload["available_filters"]["time_ranges"], ["all", "today", "7d", "30d"])
+        self.assertEqual(payload["available_filters"]["categories"], [])
+
+    def test_dashboard_time_range_filter_works_for_sqlite_repository(self) -> None:
+        handle, db_path = tempfile.mkstemp(dir=os.getcwd(), suffix=".sqlite3")
+        os.close(handle)
+        os.unlink(db_path)
+        recent_time = (datetime.now() - timedelta(days=2)).isoformat(sep=" ", timespec="seconds")
+        old_time = (datetime.now() - timedelta(days=40)).isoformat(sep=" ", timespec="seconds")
+
+        try:
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE assets (
+                        id INTEGER PRIMARY KEY,
+                        qr_code TEXT,
+                        status INTEGER
+                    );
+
+                    CREATE TABLE users (
+                        user_id INTEGER PRIMARY KEY,
+                        student_id TEXT
+                    );
+
+                    CREATE TABLE operation_records (
+                        op_id INTEGER PRIMARY KEY,
+                        asset_id INTEGER,
+                        user_id INTEGER,
+                        op_type TEXT,
+                        op_time TEXT,
+                        hw_seq TEXT,
+                        hw_result TEXT,
+                        due_time TEXT
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO assets (id, qr_code, status) VALUES (?, ?, ?)",
+                    [
+                        (1, "AS-9001", 1),
+                        (2, "AS-9002", 0),
+                    ],
+                )
+                connection.executemany(
+                    "INSERT INTO users (user_id, student_id) VALUES (?, ?)",
+                    [
+                        (1, "U-9001"),
+                        (2, "U-9002"),
+                    ],
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO operation_records (op_id, asset_id, user_id, op_type, op_time, hw_seq, hw_result, due_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (1, 1, 1, ActionType.BORROW.value, recent_time, "101", ConfirmResult.CONFIRMED.value, None),
+                        (2, 2, 2, ActionType.BORROW.value, old_time, "102", ConfirmResult.CONFIRMED.value, None),
+                        (3, 1, 1, ActionType.RETURN.value, recent_time, "103", ConfirmResult.CONFIRMED.value, None),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            repository = SQLiteTransactionRepository(db_path)
+            runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+            app = create_app(runtime)
+
+            with TestClient(app) as client:
+                response = client.get("/dashboard?time_range=7d")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["filters"]["time_range"], "7d")
+            self.assertEqual(payload["summary"]["in_stock"], 1)
+            self.assertEqual(payload["summary"]["borrowed"], 1)
+            self.assertEqual(
+                payload["operation_stats"],
+                {
+                    "borrow_count": 1,
+                    "return_count": 1,
+                },
+            )
+            self.assertEqual(payload["borrow_top_assets"], [{"asset_id": "AS-9001", "count": 1}])
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_records_returns_filtered_items_with_hardware_trace_fields(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED}
+        )
+        repository.records.extend(
+            [
+                self.build_operation_record(
+                    asset_id="AS-1001",
+                    user_id="U-1001",
+                    action_type=ActionType.BORROW,
+                    request_seq=1,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-1002",
+                    user_id="U-1002",
+                    action_type=ActionType.RETURN,
+                    request_seq=2,
+                ),
+            ]
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/records?asset_id=AS-1001&action_type=BORROW&time_range=all")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["filters"],
+            {"asset_id": "AS-1001", "action_type": "BORROW", "time_range": "all"},
+        )
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["available_filters"]["action_types"], ["BORROW", "RETURN", "INBOUND"])
+        self.assertEqual(payload["available_filters"]["time_ranges"], ["all", "today", "7d", "30d"])
+        self.assertEqual(
+            payload["items"][0],
+            {
+                "asset_id": "AS-1001",
+                "action_type": "BORROW",
+                "user_id": "U-1001",
+                "user_name": "Dashboard Tester",
+                "op_time": "",
+                "hw_seq": 2147483649,
+                "hw_result": "CONFIRMED",
+                "hw_sn": "STM32F103-A23",
+            },
+        )
+
+    def test_records_time_range_filter_works_for_sqlite_repository(self) -> None:
+        handle, db_path = tempfile.mkstemp(dir=os.getcwd(), suffix=".sqlite3")
+        os.close(handle)
+        os.unlink(db_path)
+        recent_time = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
+        old_time = (datetime.now() - timedelta(days=45)).isoformat(sep=" ", timespec="seconds")
+
+        try:
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE assets (
+                        id INTEGER PRIMARY KEY,
+                        qr_code TEXT,
+                        status INTEGER
+                    );
+
+                    CREATE TABLE users (
+                        user_id INTEGER PRIMARY KEY,
+                        user_name TEXT,
+                        student_id TEXT
+                    );
+
+                    CREATE TABLE operation_records (
+                        op_id INTEGER PRIMARY KEY,
+                        asset_id INTEGER,
+                        user_id INTEGER,
+                        op_type TEXT,
+                        op_time TEXT,
+                        hw_seq TEXT,
+                        hw_result TEXT,
+                        hw_sn TEXT,
+                        due_time TEXT
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO assets (id, qr_code, status) VALUES (?, ?, ?)",
+                    [
+                        (1, "AS-9101", 1),
+                        (2, "AS-9102", 0),
+                    ],
+                )
+                connection.executemany(
+                    "INSERT INTO users (user_id, user_name, student_id) VALUES (?, ?, ?)",
+                    [
+                        (1, "Alice", "U-9101"),
+                        (2, "Bob", "U-9102"),
+                    ],
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO operation_records (op_id, asset_id, user_id, op_type, op_time, hw_seq, hw_result, hw_sn, due_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (1, 1, 1, ActionType.BORROW.value, recent_time, "201", ConfirmResult.CONFIRMED.value, "STM32-A", None),
+                        (2, 2, 2, ActionType.RETURN.value, old_time, "202", ConfirmResult.CONFIRMED.value, "STM32-B", None),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            repository = SQLiteTransactionRepository(db_path)
+            runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+            app = create_app(runtime)
+
+            with TestClient(app) as client:
+                response = client.get("/records?time_range=7d")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["filters"]["time_range"], "7d")
+            self.assertEqual(payload["total"], 1)
+            self.assertEqual(payload["items"][0]["asset_id"], "AS-9101")
+            self.assertEqual(payload["items"][0]["action_type"], "BORROW")
+            self.assertEqual(payload["items"][0]["user_id"], "U-9101")
+            self.assertEqual(payload["items"][0]["user_name"], "Alice")
+            self.assertEqual(payload["items"][0]["hw_seq"], "201")
+            self.assertEqual(payload["items"][0]["hw_result"], ConfirmResult.CONFIRMED.value)
+            self.assertEqual(payload["items"][0]["hw_sn"], "STM32-A")
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_asset_changes_returns_filtered_items_with_status_transitions(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED}
+        )
+        repository.records.extend(
+            [
+                self.build_operation_record(
+                    asset_id="AS-1001",
+                    user_id="U-1001",
+                    action_type=ActionType.BORROW,
+                    request_seq=1,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-1002",
+                    user_id="U-1002",
+                    action_type=ActionType.RETURN,
+                    request_seq=2,
+                ),
+            ]
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/asset-changes?asset_id=AS-1002&action_type=RETURN&time_range=all")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["filters"],
+            {"asset_id": "AS-1002", "action_type": "RETURN", "time_range": "all"},
+        )
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["available_filters"]["action_types"], ["BORROW", "RETURN", "INBOUND"])
+        self.assertEqual(payload["available_filters"]["time_ranges"], ["all", "today", "7d", "30d"])
+        self.assertEqual(
+            payload["items"][0],
+            {
+                "asset_id": "AS-1002",
+                "action_type": "RETURN",
+                "from_status": "借出",
+                "to_status": "在库",
+                "user_id": "U-1002",
+                "user_name": "Dashboard Tester",
+                "op_time": "",
+                "hw_seq": 2147483650,
+                "hw_result": "CONFIRMED",
+                "hw_sn": "STM32F103-A23",
+            },
+        )
+
+    def test_asset_changes_time_range_filter_works_for_sqlite_repository(self) -> None:
+        handle, db_path = tempfile.mkstemp(dir=os.getcwd(), suffix=".sqlite3")
+        os.close(handle)
+        os.unlink(db_path)
+        recent_time = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
+        old_time = (datetime.now() - timedelta(days=45)).isoformat(sep=" ", timespec="seconds")
+
+        try:
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE assets (
+                        id INTEGER PRIMARY KEY,
+                        qr_code TEXT,
+                        status INTEGER
+                    );
+
+                    CREATE TABLE users (
+                        user_id INTEGER PRIMARY KEY,
+                        user_name TEXT,
+                        student_id TEXT
+                    );
+
+                    CREATE TABLE operation_records (
+                        op_id INTEGER PRIMARY KEY,
+                        asset_id INTEGER,
+                        user_id INTEGER,
+                        op_type TEXT,
+                        op_time TEXT,
+                        hw_seq TEXT,
+                        hw_result TEXT,
+                        hw_sn TEXT,
+                        due_time TEXT
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO assets (id, qr_code, status) VALUES (?, ?, ?)",
+                    [
+                        (1, "AS-9301", 1),
+                        (2, "AS-9302", 0),
+                    ],
+                )
+                connection.executemany(
+                    "INSERT INTO users (user_id, user_name, student_id) VALUES (?, ?, ?)",
+                    [
+                        (1, "Alice", "U-9301"),
+                        (2, "Bob", "U-9302"),
+                    ],
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO operation_records (op_id, asset_id, user_id, op_type, op_time, hw_seq, hw_result, hw_sn, due_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (1, 1, 1, ActionType.BORROW.value, recent_time, "401", ConfirmResult.CONFIRMED.value, "STM32-E", None),
+                        (2, 2, 2, ActionType.RETURN.value, old_time, "402", ConfirmResult.CONFIRMED.value, "STM32-F", None),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            repository = SQLiteTransactionRepository(db_path)
+            runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+            app = create_app(runtime)
+
+            with TestClient(app) as client:
+                response = client.get("/asset-changes?time_range=7d")
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["filters"]["time_range"], "7d")
+            self.assertEqual(payload["total"], 1)
+            self.assertEqual(payload["items"][0]["asset_id"], "AS-9301")
+            self.assertEqual(payload["items"][0]["action_type"], "BORROW")
+            self.assertEqual(payload["items"][0]["from_status"], "在库")
+            self.assertEqual(payload["items"][0]["to_status"], "借出")
+            self.assertEqual(payload["items"][0]["user_id"], "U-9301")
+            self.assertEqual(payload["items"][0]["user_name"], "Alice")
+            self.assertEqual(payload["items"][0]["hw_seq"], "401")
+            self.assertEqual(payload["items"][0]["hw_result"], ConfirmResult.CONFIRMED.value)
+            self.assertEqual(payload["items"][0]["hw_sn"], "STM32-E")
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_exceptions_returns_runtime_failure_items_with_filters(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(open_status=DeviceStatus.OFFLINE),
+            initial_assets={"AS-9401": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            failure_response = client.post(
+                "/transactions/borrow",
+                json={"asset_id": "AS-9401", "user_id": "U-9401", "user_name": "User X", "timeout_ms": 100},
+            )
+            response = client.get("/exceptions?asset_id=AS-9401&action_type=BORROW&code=DEVICE_OFFLINE&time_range=all")
+
+        self.assertEqual(failure_response.status_code, 200)
+        self.assertEqual(failure_response.json()["code"], ConfirmResult.DEVICE_OFFLINE.value)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["filters"],
+            {
+                "asset_id": "AS-9401",
+                "action_type": "BORROW",
+                "code": "DEVICE_OFFLINE",
+                "time_range": "all",
+            },
+        )
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["available_filters"]["action_types"], ["BORROW", "RETURN", "INBOUND"])
+        self.assertEqual(payload["available_filters"]["time_ranges"], ["all", "today", "7d", "30d"])
+        self.assertIn(ConfirmResult.DEVICE_OFFLINE.value, payload["available_filters"]["codes"])
+        item = payload["items"][0]
+        self.assertEqual(item["asset_id"], "AS-9401")
+        self.assertEqual(item["action_type"], ActionType.BORROW.value)
+        self.assertEqual(item["user_id"], "U-9401")
+        self.assertEqual(item["user_name"], "User X")
+        self.assertEqual(item["code"], ConfirmResult.DEVICE_OFFLINE.value)
+        self.assertTrue(item["message"])
+        self.assertTrue(item["event_time"])
+        self.assertIn("request_seq", item)
+        self.assertIn("hw_seq", item)
+        self.assertIn("hw_result", item)
+
+    def test_exceptions_time_range_filter_works_for_runtime_records(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-9501": AssetStatus.IN_STOCK},
+        )
+        recent_time = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
+        old_time = (datetime.now() - timedelta(days=45)).isoformat(sep=" ", timespec="seconds")
+
+        with runtime.exception_records_lock:
+            runtime.exception_records.extend(
+                [
+                    {
+                        "asset_id": "AS-9501",
+                        "action_type": ActionType.BORROW.value,
+                        "user_id": "U-9501",
+                        "user_name": "Alice",
+                        "code": ConfirmResult.INTERNAL_ERROR.value,
+                        "message": "recent error",
+                        "event_time": recent_time,
+                        "request_seq": 100,
+                        "hw_seq": None,
+                        "hw_result": None,
+                    },
+                    {
+                        "asset_id": "AS-9502",
+                        "action_type": ActionType.RETURN.value,
+                        "user_id": "U-9502",
+                        "user_name": "Bob",
+                        "code": ConfirmResult.STATE_INVALID.value,
+                        "message": "old error",
+                        "event_time": old_time,
+                        "request_seq": None,
+                        "hw_seq": None,
+                        "hw_result": None,
+                    },
+                ]
+            )
+
+        app = create_app(runtime)
+        with TestClient(app) as client:
+            response = client.get("/exceptions?time_range=7d")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["filters"]["time_range"], "7d")
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["asset_id"], "AS-9501")
+        self.assertEqual(payload["items"][0]["action_type"], ActionType.BORROW.value)
+        self.assertEqual(payload["items"][0]["code"], ConfirmResult.INTERNAL_ERROR.value)
+        self.assertEqual(payload["items"][0]["message"], "recent error")
+
+    def test_export_assets_csv_is_accessible(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/export/assets.csv")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        self.assertIn("assets_export.csv", response.headers.get("content-disposition", ""))
+        csv_text = self.decode_csv_body(response)
+        self.assertIn("asset_id,asset_status,asset_name,category,location", csv_text)
+        self.assertIn("AS-1001,在库", csv_text)
+        self.assertIn("AS-1002,借出", csv_text)
+
+    def test_export_operations_csv_is_accessible(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-1001": AssetStatus.IN_STOCK})
+        repository.records.extend(
+            [
+                self.build_operation_record(
+                    asset_id="AS-1001",
+                    user_id="U-1001",
+                    action_type=ActionType.BORROW,
+                    request_seq=1,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-1001",
+                    user_id="U-1001",
+                    action_type=ActionType.RETURN,
+                    request_seq=2,
+                ),
+            ]
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/export/operations.csv")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        self.assertIn("operation_records_export.csv", response.headers.get("content-disposition", ""))
+        csv_text = self.decode_csv_body(response)
+        self.assertIn("asset_id,action_type,user_id,user_name,op_time,hw_seq,hw_result", csv_text)
+        self.assertIn("AS-1001,BORROW,U-1001,Dashboard Tester", csv_text)
+        self.assertIn("AS-1001,RETURN,U-1001,Dashboard Tester", csv_text)
+
+    def test_export_records_csv_respects_asset_and_action_filters(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED}
+        )
+        repository.records.extend(
+            [
+                self.build_operation_record(
+                    asset_id="AS-1001",
+                    user_id="U-1001",
+                    action_type=ActionType.BORROW,
+                    request_seq=1,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-1002",
+                    user_id="U-1002",
+                    action_type=ActionType.RETURN,
+                    request_seq=2,
+                ),
+            ]
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/export/records.csv?asset_id=AS-1001&action_type=BORROW&time_range=all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        self.assertIn("records_export.csv", response.headers.get("content-disposition", ""))
+        csv_text = self.decode_csv_body(response)
+        self.assertIn("asset_id,action_type,user_id,user_name,op_time,hw_seq,hw_result,hw_sn", csv_text)
+        self.assertIn("AS-1001,BORROW,U-1001,Dashboard Tester,,2147483649,CONFIRMED,STM32F103-A23", csv_text)
+        self.assertNotIn("AS-1002,RETURN", csv_text)
+
+    def test_export_records_csv_respects_time_range_filter(self) -> None:
+        handle, db_path = tempfile.mkstemp(dir=os.getcwd(), suffix=".sqlite3")
+        os.close(handle)
+        os.unlink(db_path)
+        recent_time = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
+        old_time = (datetime.now() - timedelta(days=45)).isoformat(sep=" ", timespec="seconds")
+
+        try:
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE assets (
+                        id INTEGER PRIMARY KEY,
+                        qr_code TEXT,
+                        status INTEGER
+                    );
+
+                    CREATE TABLE users (
+                        user_id INTEGER PRIMARY KEY,
+                        user_name TEXT,
+                        student_id TEXT
+                    );
+
+                    CREATE TABLE operation_records (
+                        op_id INTEGER PRIMARY KEY,
+                        asset_id INTEGER,
+                        user_id INTEGER,
+                        op_type TEXT,
+                        op_time TEXT,
+                        hw_seq TEXT,
+                        hw_result TEXT,
+                        hw_sn TEXT,
+                        due_time TEXT
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO assets (id, qr_code, status) VALUES (?, ?, ?)",
+                    [
+                        (1, "AS-9201", 1),
+                        (2, "AS-9202", 0),
+                    ],
+                )
+                connection.executemany(
+                    "INSERT INTO users (user_id, user_name, student_id) VALUES (?, ?, ?)",
+                    [
+                        (1, "Alice", "U-9201"),
+                        (2, "Bob", "U-9202"),
+                    ],
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO operation_records (op_id, asset_id, user_id, op_type, op_time, hw_seq, hw_result, hw_sn, due_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (1, 1, 1, ActionType.BORROW.value, recent_time, "301", ConfirmResult.CONFIRMED.value, "STM32-C", None),
+                        (2, 2, 2, ActionType.RETURN.value, old_time, "302", ConfirmResult.CONFIRMED.value, "STM32-D", None),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            repository = SQLiteTransactionRepository(db_path)
+            runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+            app = create_app(runtime)
+
+            with TestClient(app) as client:
+                response = client.get("/export/records.csv?time_range=7d")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+            csv_text = self.decode_csv_body(response)
+            self.assertIn("asset_id,action_type,user_id,user_name,op_time,hw_seq,hw_result,hw_sn", csv_text)
+            self.assertIn("AS-9201,BORROW,U-9201,Alice", csv_text)
+            self.assertIn("301,CONFIRMED,STM32-C", csv_text)
+            self.assertNotIn("AS-9202,RETURN,U-9202,Bob", csv_text)
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_export_exceptions_csv_respects_asset_action_and_code_filters(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-9601": AssetStatus.IN_STOCK},
+        )
+        with runtime.exception_records_lock:
+            runtime.exception_records.extend(
+                [
+                    {
+                        "asset_id": "AS-9601",
+                        "action_type": ActionType.BORROW.value,
+                        "user_id": "U-9601",
+                        "user_name": "Alice",
+                        "code": ConfirmResult.DEVICE_OFFLINE.value,
+                        "message": "device offline",
+                        "event_time": datetime.now().isoformat(sep=" ", timespec="seconds"),
+                        "request_seq": 101,
+                        "hw_seq": None,
+                        "hw_result": None,
+                    },
+                    {
+                        "asset_id": "AS-9602",
+                        "action_type": ActionType.RETURN.value,
+                        "user_id": "U-9602",
+                        "user_name": "Bob",
+                        "code": ConfirmResult.STATE_INVALID.value,
+                        "message": "state invalid",
+                        "event_time": datetime.now().isoformat(sep=" ", timespec="seconds"),
+                        "request_seq": 102,
+                        "hw_seq": None,
+                        "hw_result": None,
+                    },
+                ]
+            )
+
+        app = create_app(runtime)
+        with TestClient(app) as client:
+            response = client.get(
+                "/export/exceptions.csv?asset_id=AS-9601&action_type=BORROW&code=DEVICE_OFFLINE&time_range=all"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        self.assertIn("exceptions_export.csv", response.headers.get("content-disposition", ""))
+        csv_text = self.decode_csv_body(response)
+        self.assertIn(
+            "asset_id,action_type,user_id,user_name,code,message,event_time,request_seq,hw_seq,hw_result",
+            csv_text,
+        )
+        self.assertIn("AS-9601,BORROW,U-9601,Alice,DEVICE_OFFLINE,device offline", csv_text)
+        self.assertNotIn("AS-9602,RETURN,U-9602,Bob,STATE_INVALID,state invalid", csv_text)
+
+    def test_export_exceptions_csv_respects_time_range_filter(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-9701": AssetStatus.IN_STOCK},
+        )
+        recent_time = (datetime.now() - timedelta(days=1)).isoformat(sep=" ", timespec="seconds")
+        old_time = (datetime.now() - timedelta(days=45)).isoformat(sep=" ", timespec="seconds")
+
+        with runtime.exception_records_lock:
+            runtime.exception_records.extend(
+                [
+                    {
+                        "asset_id": "AS-9701",
+                        "action_type": ActionType.BORROW.value,
+                        "user_id": "U-9701",
+                        "user_name": "Alice",
+                        "code": ConfirmResult.ACK_TIMEOUT.value,
+                        "message": "recent ack timeout",
+                        "event_time": recent_time,
+                        "request_seq": 201,
+                        "hw_seq": None,
+                        "hw_result": None,
+                    },
+                    {
+                        "asset_id": "AS-9702",
+                        "action_type": ActionType.RETURN.value,
+                        "user_id": "U-9702",
+                        "user_name": "Bob",
+                        "code": ConfirmResult.INTERNAL_ERROR.value,
+                        "message": "old internal error",
+                        "event_time": old_time,
+                        "request_seq": 202,
+                        "hw_seq": None,
+                        "hw_result": None,
+                    },
+                ]
+            )
+
+        app = create_app(runtime)
+        with TestClient(app) as client:
+            response = client.get("/export/exceptions.csv?time_range=7d")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/csv"))
+        csv_text = self.decode_csv_body(response)
+        self.assertIn("AS-9701,BORROW,U-9701,Alice,ACK_TIMEOUT,recent ack timeout", csv_text)
+        self.assertNotIn("AS-9702,RETURN,U-9702,Bob,INTERNAL_ERROR,old internal error", csv_text)
+
+    def test_export_dashboard_json_is_accessible(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK, "AS-1002": AssetStatus.BORROWED}
+        )
+        repository.records.append(
+            self.build_operation_record(
+                asset_id="AS-1002",
+                user_id="U-1001",
+                action_type=ActionType.BORROW,
+                request_seq=1,
+            )
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/export/dashboard.json?time_range=all")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("application/json"))
+        self.assertIn("dashboard_report.json", response.headers.get("content-disposition", ""))
+        payload = response.json()
+        self.assertEqual(payload["filters"]["time_range"], "all")
+        self.assertEqual(payload["summary"]["in_stock"], 1)
+        self.assertEqual(payload["summary"]["borrowed"], 1)
+        self.assertEqual(payload["operation_stats"]["borrow_count"], 1)
+        self.assertEqual(payload["borrow_top_assets"], [{"asset_id": "AS-1002", "count": 1}])
+
+    def test_scan_result_returns_asset_not_found_contract(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-1001": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post("/scan/result", json={"asset_id": "AS-404"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["success"], False)
+        self.assertEqual(payload["code"], "ASSET_NOT_FOUND")
+        self.assertTrue(payload["message"])
+        self.assertEqual(payload["asset_id"], "AS-404")
+        self.assertEqual(
+            payload["extra"],
+            {
+                "exists": False,
+                "asset_status": None,
+                "device_status": DeviceStatus.ONLINE.value,
+            },
+        )
+
+    def test_inbound_api_success_with_confirmed_creates_asset_and_record(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={})
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            ),
+            repository=repository,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8001",
+                    "user_id": "U-ADMIN",
+                    "user_name": "管理员",
+                    "asset_name": "ThinkPad X1",
+                    "category_id": 1,
+                    "location": "Cabinet A",
+                    "raw_text": "AS-8001",
+                    "symbology": "QR_CODE",
+                    "timeout_ms": 300,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["code"], ConfirmResult.CONFIRMED.value)
+        self.assertEqual(payload["action_type"], ActionType.INBOUND.value)
+        self.assertEqual(payload["transaction_state"], "COMPLETED")
+        self.assertEqual(repository.assets["AS-8001"], AssetStatus.IN_STOCK)
+        self.assertEqual(repository.asset_details["AS-8001"]["asset_name"], "ThinkPad X1")
+        self.assertEqual(repository.asset_details["AS-8001"]["category_id"], 1)
+        self.assertEqual(repository.asset_details["AS-8001"]["location"], "Cabinet A")
+        self.assertEqual(repository.records[0].action_type, ActionType.INBOUND)
+        self.assertEqual(repository.records[0].hw_result, ConfirmResult.CONFIRMED.value)
+
+    def test_inbound_api_param_invalid_when_asset_name_blank(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8002",
+                    "user_id": "U-ADMIN",
+                    "user_name": "管理员",
+                    "asset_name": "",
+                    "category_id": 1,
+                    "location": "Cabinet B",
+                    "timeout_ms": 300,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["code"], ConfirmResult.PARAM_INVALID.value)
+
+    def test_inbound_api_permission_denied_for_non_admin(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8003",
+                    "user_id": "U-1001",
+                    "user_name": "普通用户",
+                    "asset_name": "Dell Dock",
+                    "category_id": 1,
+                    "location": "Desk 1",
+                    "timeout_ms": 300,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], ConfirmResult.PERMISSION_DENIED.value)
+
+    def test_inbound_api_offline_and_busy_failures(self) -> None:
+        offline_runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(open_status=DeviceStatus.OFFLINE),
+            initial_assets={},
+        )
+        offline_app = create_app(offline_runtime)
+        with TestClient(offline_app) as client:
+            offline_response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8004",
+                    "user_id": "U-ADMIN",
+                    "user_name": "管理员",
+                    "asset_name": "USB Hub",
+                    "category_id": 1,
+                    "location": "Shelf A",
+                    "timeout_ms": 300,
+                },
+            )
+
+        busy_runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        busy_runtime.service.transaction_manager.create_transaction(
+            asset_id="AS-8005",
+            user_id="U-ADMIN",
+            user_name="管理员",
+            action_type=ActionType.INBOUND,
+            request_id="req-busy",
+            request_seq=999,
+        )
+        busy_app = create_app(busy_runtime)
+        with TestClient(busy_app) as client:
+            busy_response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8005",
+                    "user_id": "U-ADMIN",
+                    "user_name": "管理员",
+                    "asset_name": "USB Hub",
+                    "category_id": 1,
+                    "location": "Shelf B",
+                    "timeout_ms": 300,
+                },
+            )
+
+        self.assertEqual(offline_response.status_code, 200)
+        self.assertEqual(offline_response.json()["code"], ConfirmResult.DEVICE_OFFLINE.value)
+        self.assertEqual(busy_response.status_code, 200)
+        self.assertEqual(busy_response.json()["code"], ConfirmResult.BUSY.value)
+
+    def test_inbound_api_ack_failures_map_to_business_result_codes(self) -> None:
+        cases = [
+            (MsgType.ACK_BUSY, "DEVICE_BUSY", ConfirmResult.BUSY.value),
+            (MsgType.ACK_INVALID, "INVALID_REQUEST", ConfirmResult.ACK_INVALID.value),
+            (MsgType.ACK_ERROR, "CRC_CHECK_FAIL", ConfirmResult.ACK_ERROR.value),
+            (None, "ACK timeout after 3 retries", ConfirmResult.ACK_TIMEOUT.value),
+        ]
+
+        for ack_type, message, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                runtime = self.build_runtime(
+                    serial_manager=FakeSerialManager(
+                        send_result=SendResult(
+                            success=False,
+                            seq_id=100,
+                            ack_type=ack_type,
+                            message=message,
+                            ack_payload=None if ack_type is None else {"detail": message},
+                        )
+                    ),
+                    initial_assets={},
+                )
+                app = create_app(runtime)
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/transactions/inbound",
+                        json={
+                            "asset_id": f"AS-{expected_code}",
+                            "user_id": "U-ADMIN",
+                            "user_name": "管理员",
+                            "asset_name": "Adapter",
+                            "category_id": 1,
+                            "location": "Rack X",
+                            "timeout_ms": 300,
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["code"], expected_code)
+
+    def test_inbound_api_hw_failures_and_commit_rollback(self) -> None:
+        for confirm_result in (ConfirmResult.CANCELLED.value, ConfirmResult.TIMEOUT.value):
+            with self.subTest(confirm_result=confirm_result):
+                runtime = self.build_runtime(
+                    serial_manager=FakeSerialManager(
+                        response_factory=lambda payload, seq_id, confirm_result=confirm_result: self.build_event_frame(
+                            payload,
+                            confirm_result=confirm_result,
+                        )
+                    ),
+                    initial_assets={},
+                )
+                app = create_app(runtime)
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/transactions/inbound",
+                        json={
+                            "asset_id": f"AS-HW-{confirm_result}",
+                            "user_id": "U-ADMIN",
+                            "user_name": "管理员",
+                            "asset_name": "Keyboard",
+                            "category_id": 1,
+                            "location": "Rack Y",
+                            "timeout_ms": 300,
+                        },
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["code"], confirm_result)
+
+        repository = FailingCommitRepository(asset_id="AS-8010", initial_status=None, failure=RuntimeError("db down"))
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            ),
+            repository=repository,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            rollback_response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8010",
+                    "user_id": "U-ADMIN",
+                    "user_name": "管理员",
+                    "asset_name": "Mouse",
+                    "category_id": 1,
+                    "location": "Rack Z",
+                    "timeout_ms": 300,
+                },
+            )
+
+        self.assertEqual(rollback_response.status_code, 200)
+        self.assertEqual(rollback_response.json()["code"], ConfirmResult.INTERNAL_ERROR.value)
+        self.assertEqual(repository.rollback_calls, [("AS-8010", "db down")])
+
+    def test_inbound_success_updates_websocket_assets_records_asset_changes_and_dashboard(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-EXISTING": AssetStatus.IN_STOCK})
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            ),
+            repository=repository,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            dashboard_before = client.get("/dashboard?time_range=all").json()
+            with client.websocket_connect("/ws/status") as websocket:
+                response = client.post(
+                    "/transactions/inbound",
+                    json={
+                        "asset_id": "AS-8020",
+                        "user_id": "U-ADMIN",
+                        "user_name": "管理员",
+                        "asset_name": "Surface Pro",
+                        "category_id": 1,
+                        "location": "Cabinet C",
+                        "raw_text": "AS-8020",
+                        "timeout_ms": 300,
+                    },
+                )
+                messages = [websocket.receive_json(), websocket.receive_json(), websocket.receive_json()]
+
+            assets_payload = client.get("/assets").json()
+            records_payload = client.get("/records?action_type=INBOUND&time_range=all").json()
+            asset_changes_payload = client.get("/asset-changes?action_type=INBOUND&time_range=all").json()
+            dashboard_after = client.get("/dashboard?time_range=all").json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([message["code"] for message in messages], ["WAITING_ACK", "WAITING_HW", "CONFIRMED"])
+        self.assertTrue(response.json()["success"])
+        self.assertEqual(response.json()["action_type"], ActionType.INBOUND.value)
+        self.assertEqual(assets_payload["AS-8020"], AssetStatus.IN_STOCK.value)
+        self.assertEqual(records_payload["total"], 1)
+        self.assertEqual(records_payload["items"][0]["action_type"], ActionType.INBOUND.value)
+        self.assertEqual(records_payload["items"][0]["asset_id"], "AS-8020")
+        self.assertEqual(asset_changes_payload["total"], 1)
+        self.assertEqual(asset_changes_payload["items"][0]["from_status"], "未建档")
+        self.assertEqual(asset_changes_payload["items"][0]["to_status"], AssetStatus.IN_STOCK.value)
+        self.assertIn(ActionType.INBOUND.value, records_payload["available_filters"]["action_types"])
+        self.assertIn(ActionType.INBOUND.value, asset_changes_payload["available_filters"]["action_types"])
+        self.assertEqual(dashboard_before["summary"]["in_stock"], 1)
+        self.assertEqual(dashboard_after["summary"]["in_stock"], 2)
+
+    def test_inbound_failures_are_visible_in_exceptions_feed_with_inbound_filter(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-8021",
+                    "user_id": "U-1001",
+                    "user_name": "普通用户",
+                    "asset_name": "Mini PC",
+                    "category_id": 1,
+                    "location": "Cabinet D",
+                    "timeout_ms": 300,
+                },
+            )
+            exceptions_payload = client.get(
+                "/exceptions?action_type=INBOUND&code=PERMISSION_DENIED&time_range=all"
+            ).json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], ConfirmResult.PERMISSION_DENIED.value)
+        self.assertEqual(exceptions_payload["total"], 1)
+        self.assertEqual(exceptions_payload["items"][0]["action_type"], ActionType.INBOUND.value)
+        self.assertEqual(exceptions_payload["items"][0]["code"], ConfirmResult.PERMISSION_DENIED.value)
+        self.assertIn(ActionType.INBOUND.value, exceptions_payload["available_filters"]["action_types"])
 
     def test_borrow_api_success_with_mock_mcu_confirmed(self) -> None:
         mock_server = MockMCUServer(host="127.0.0.1", port=9301, mode="confirmed", confirm_delay=0.05)

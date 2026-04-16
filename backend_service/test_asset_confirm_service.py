@@ -6,7 +6,16 @@ import unittest
 from typing import Callable
 
 import runtime_paths  # noqa: F401
-from models import ActionType, AssetStatus, ConfirmResult, TransactionState
+from models import (
+    ActionType,
+    AssetStatus,
+    BorrowApprovalCommand,
+    BorrowRequestCreateCommand,
+    BorrowRequestStatus,
+    ConfirmResult,
+    InboundCommand,
+    TransactionState,
+)
 from protocol import Frame, MsgType
 from repository import InMemoryTransactionRepository
 from serial_manager import SendResult
@@ -107,6 +116,18 @@ class ProtocolOnlyRepository:
             self._asset_status = AssetStatus.BORROWED
         else:
             self._asset_status = AssetStatus.IN_STOCK
+        return self._asset_status
+
+    def category_exists(self, category_id: int) -> bool:
+        return category_id == 1
+
+    def apply_inbound_atomically(self, commit):
+        self.last_record = commit
+        if self._fail_on_commit is not None:
+            raise self._fail_on_commit
+
+        self._asset_id = commit.asset_id
+        self._asset_status = AssetStatus.IN_STOCK
         return self._asset_status
 
     def rollback_transaction(self, asset_id: str, reason: str) -> None:
@@ -381,6 +402,122 @@ class AssetConfirmServiceTests(unittest.TestCase):
         self.assertEqual(result.code, ConfirmResult.INTERNAL_ERROR.value)
         self.assertEqual(result.transaction_state, TransactionState.FAILED)
         self.assertEqual(repository.rollback_calls, [("AS-3001", "db down")])
+
+    def test_create_borrow_request_rejects_when_pending_transaction_exists(self) -> None:
+        serial_manager = FakeSerialManager()
+        repository = InMemoryTransactionRepository(initial_assets={"AS-6101": AssetStatus.IN_STOCK})
+        transaction_manager = TransactionManager()
+        service = AssetConfirmService(
+            serial_manager=serial_manager,
+            repository=repository,
+            transaction_manager=transaction_manager,
+        )
+        transaction_manager.create_transaction(
+            asset_id="AS-6101",
+            user_id="U-OTHER",
+            user_name="Other User",
+            action_type=ActionType.BORROW,
+            request_id="req-pending-6101",
+            request_seq=6101,
+        )
+
+        result = service.create_borrow_request(
+            BorrowRequestCreateCommand(
+                asset_id="AS-6101",
+                user_id="U-6101",
+                user_name="Requester",
+                reason="Need this asset",
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.code, ConfirmResult.BUSY.value)
+        self.assertEqual(repository.list_borrow_requests(), [])
+
+    def test_borrow_request_can_be_approved_and_started(self) -> None:
+        serial_manager = FakeSerialManager(
+            response_factory=lambda payload, seq_id: self.build_event_frame(
+                payload,
+                confirm_result=ConfirmResult.CONFIRMED.value,
+            )
+        )
+        repository = InMemoryTransactionRepository(initial_assets={"AS-6201": AssetStatus.IN_STOCK})
+        service = AssetConfirmService(serial_manager=serial_manager, repository=repository)
+
+        created = service.create_borrow_request(
+            BorrowRequestCreateCommand(
+                asset_id="AS-6201",
+                user_id="U-6201",
+                user_name="Requester",
+                reason="Temporary use",
+            )
+        )
+        self.assertTrue(created.success)
+        self.assertIsNotNone(created.item)
+        request_id = created.item.request_id
+        self.assertEqual(created.item.status, BorrowRequestStatus.PENDING)
+
+        reviewed = service.review_borrow_request(
+            BorrowApprovalCommand(
+                request_id=request_id,
+                reviewer_user_id="U-ADMIN",
+                reviewer_user_name="Admin",
+                approved=True,
+                review_comment="approved",
+            )
+        )
+        self.assertTrue(reviewed.success)
+        self.assertIsNotNone(reviewed.item)
+        self.assertEqual(reviewed.item.status, BorrowRequestStatus.APPROVED)
+
+        result = service.start_borrow_from_request(request_id, timeout_ms=100)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+        self.assertEqual(result.transaction_state, TransactionState.COMPLETED)
+        self.assertEqual(repository.assets["AS-6201"], AssetStatus.BORROWED)
+        self.assertEqual(len(repository.records), 1)
+        self.assertEqual(repository.records[0].borrow_request_id, request_id)
+        stored = repository.get_borrow_request(request_id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.status, BorrowRequestStatus.CONSUMED)
+        self.assertIsNotNone(stored.consumed_at)
+
+    def test_successful_inbound_creates_new_asset_and_records_hw_fields(self) -> None:
+        serial_manager = FakeSerialManager(
+            response_factory=lambda payload, seq_id: self.build_event_frame(
+                payload,
+                confirm_result=ConfirmResult.CONFIRMED.value,
+            )
+        )
+        repository = InMemoryTransactionRepository(initial_assets={})
+        service = AssetConfirmService(serial_manager=serial_manager, repository=repository)
+
+        result = service.request_inbound(
+            InboundCommand(
+                asset_id="AS-7001",
+                user_id="U-ADMIN",
+                user_name="管理员",
+                asset_name="New Laptop",
+                category_id=1,
+                location="Inbound Shelf",
+                timeout_ms=100,
+                request_source="api",
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+        self.assertEqual(result.action_type, ActionType.INBOUND.value)
+        self.assertEqual(result.transaction_state, TransactionState.COMPLETED)
+        self.assertEqual(repository.assets["AS-7001"], AssetStatus.IN_STOCK)
+        self.assertEqual(repository.asset_details["AS-7001"]["asset_name"], "New Laptop")
+        self.assertEqual(len(repository.records), 1)
+        self.assertEqual(repository.records[0].request_seq, result.request_seq)
+        self.assertEqual(repository.records[0].hw_seq, result.hw_seq)
+        self.assertEqual(serial_manager.sent_requests[0][1]["asset_name"], "New Laptop")
+        self.assertEqual(serial_manager.sent_requests[0][1]["category_id"], 1)
+        self.assertEqual(serial_manager.sent_requests[0][1]["location"], "Inbound Shelf")
 
 
 if __name__ == "__main__":

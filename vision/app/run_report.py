@@ -56,6 +56,10 @@ def build_summary_payload(output: PipelineRunOutput) -> dict[str, object]:
             "conflict_count": output.conflict_count,
             "submit_success_count": output.submit_success_count,
             "submit_fail_count": output.submit_fail_count,
+            "transport_fail_count": output.transport_fail_count,
+            "http_fail_count": output.http_fail_count,
+            "protocol_fail_count": output.protocol_fail_count,
+            "business_fail_count": output.business_fail_count,
             "reconnect_attempt_count": output.reconnect_attempt_count,
             "reconnect_success_count": output.reconnect_success_count,
             "reconnect_fail_count": output.reconnect_fail_count,
@@ -88,7 +92,7 @@ def render_cli_summary(
     metadata = build_run_metadata(output)
     events = recent_events if recent_events is not None else output.recent_events
     lines = [
-        f"run status={output.status} ended_by={output.ended_by} health={output.health_state} uptime_sec={output.uptime_sec:.3f}",
+        f"runtime duration_sec={output.uptime_sec:.3f} status={output.status} ended_by={output.ended_by} health={output.health_state}",
         (
             "source "
             f"run_mode={config.runtime.run_mode} source_type={config.capture.source_type} "
@@ -108,6 +112,8 @@ def render_cli_summary(
         (
             "gateway "
             f"submit_success={output.submit_success_count} submit_fail={output.submit_fail_count} "
+            f"transport_fail={output.transport_fail_count} http_fail={output.http_fail_count} "
+            f"protocol_fail={output.protocol_fail_count} business_fail={output.business_fail_count} "
             f"reconnect_attempt={output.reconnect_attempt_count} reconnect_success={output.reconnect_success_count} "
             f"reconnect_fail={output.reconnect_fail_count}"
         ),

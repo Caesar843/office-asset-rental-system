@@ -3,15 +3,28 @@ from __future__ import annotations
 from unittest.mock import patch
 import unittest
 
-from app.config import DecodeConfig
+from app.config import DecodeConfig, VisionConfig
 from decoder.barcode_decoder import BarcodeDecoder
 from decoder.base import DecoderDependencyError, DecoderError
 from decoder.hybrid_decoder import HybridDecoder
 from decoder.qr_decoder import QRCodeDecoder
 from decoder.stub import StaticDecoder
 from models.decode_result import DecodeResult
-from models.frame import FrameData
+from models.frame import DECODE_CANDIDATES_EXTRA_KEY, PRIMARY_DECODE_CANDIDATE_EXTRA_KEY, FrameData
+from preprocess.image_enhance import ImageEnhancer
+from preprocess.roi import ROIProcessor
 from tests._fixtures import combine_images_horizontally, make_blank_image, make_code128_image, make_qr_image
+
+
+class _StageAwareDecoder:
+    def __init__(self, *, results_by_stage: dict[str, list[DecodeResult]]) -> None:
+        self._results_by_stage = results_by_stage
+        self.calls: list[str] = []
+
+    def decode(self, frame: FrameData) -> list[DecodeResult]:
+        stage = str(frame.extra.get("decode_stage", "full_original"))
+        self.calls.append(stage)
+        return list(self._results_by_stage.get(stage, []))
 
 
 class DecoderTests(unittest.TestCase):
@@ -112,6 +125,96 @@ class DecoderTests(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         self.assertEqual([item.raw_text for item in results], ["AS-2007", "AS-2008"])
+
+    def test_hybrid_decoder_tries_roi_then_enhancement_then_full_frame_fallback(self) -> None:
+        config = VisionConfig.from_overrides(
+            preprocess={"enable_roi": True, "roi": (0.0, 0.0, 0.45, 1.0), "roi_fallback_to_full_frame": True},
+        )
+        frame = FrameData(
+            frame_id="frame-stage-1",
+            image=combine_images_horizontally(make_blank_image(width=220, height=220), make_qr_image("AS-2009")),
+            timestamp=1700000006,
+            source_id="webcam-0",
+        )
+        prepared = ImageEnhancer(config.preprocess).prepare(ROIProcessor(config.preprocess).apply(frame))
+        qr_decoder = _StageAwareDecoder(
+            results_by_stage={
+                "full_original": [
+                    DecodeResult(raw_text="AS-2009", symbology="QR", bbox=(12, 18, 40, 40), decoder_name="stage-qr")
+                ]
+            }
+        )
+        barcode_decoder = _StageAwareDecoder(results_by_stage={})
+        decoder = HybridDecoder(config.decode, qr_decoder=qr_decoder, barcode_decoder=barcode_decoder)
+
+        results = decoder.decode(prepared)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].raw_text, "AS-2009")
+        self.assertEqual(qr_decoder.calls[:3], ["roi_original", "roi_enhanced", "full_original"])
+        self.assertEqual(results[0].extra["decode_stage"], "full_original")
+        self.assertTrue(results[0].extra["decode_used_fallback"])
+
+    def test_hybrid_decoder_can_succeed_on_enhanced_stage_before_full_fallback(self) -> None:
+        config = VisionConfig.from_overrides(
+            preprocess={"enable_roi": True, "roi": (0.0, 0.0, 0.45, 1.0), "roi_fallback_to_full_frame": True},
+        )
+        frame = FrameData(
+            frame_id="frame-stage-2",
+            image=combine_images_horizontally(make_blank_image(width=220, height=220), make_qr_image("AS-2010")),
+            timestamp=1700000007,
+            source_id="webcam-0",
+        )
+        prepared = ImageEnhancer(config.preprocess).prepare(ROIProcessor(config.preprocess).apply(frame))
+        qr_decoder = _StageAwareDecoder(
+            results_by_stage={
+                "roi_enhanced": [
+                    DecodeResult(raw_text="AS-2010", symbology="QR", bbox=(8, 10, 24, 24), decoder_name="stage-qr")
+                ]
+            }
+        )
+        decoder = HybridDecoder(config.decode, qr_decoder=qr_decoder, barcode_decoder=_StageAwareDecoder(results_by_stage={}))
+
+        results = decoder.decode(prepared)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].extra["decode_stage"], "roi_enhanced")
+        self.assertEqual(qr_decoder.calls, ["roi_original", "roi_enhanced"])
+
+    def test_hybrid_decoder_translates_roi_bbox_back_to_full_frame_coordinates(self) -> None:
+        candidate_image = make_qr_image("AS-2011")
+        frame = FrameData(
+            frame_id="frame-stage-3",
+            image=make_blank_image(width=320, height=240),
+            timestamp=1700000008,
+            source_id="webcam-0",
+            extra={
+                DECODE_CANDIDATES_EXTRA_KEY: [
+                    {
+                        "name": "roi_original",
+                        "image": candidate_image,
+                        "bbox_offset": (15, 20),
+                        "origin": "roi",
+                        "variant": "original",
+                        "preprocess_steps": ("roi",),
+                    }
+                ],
+                PRIMARY_DECODE_CANDIDATE_EXTRA_KEY: "roi_original",
+            },
+        )
+        qr_decoder = _StageAwareDecoder(
+            results_by_stage={
+                "roi_original": [
+                    DecodeResult(raw_text="AS-2011", symbology="QR", bbox=(1, 2, 30, 40), decoder_name="stage-qr")
+                ]
+            }
+        )
+        decoder = HybridDecoder(DecodeConfig(), qr_decoder=qr_decoder, barcode_decoder=_StageAwareDecoder(results_by_stage={}))
+
+        results = decoder.decode(frame)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].bbox, (16, 22, 30, 40))
 
 
 if __name__ == "__main__":

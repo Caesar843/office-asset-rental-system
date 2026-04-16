@@ -6,7 +6,7 @@ from app.config import DedupConfig
 from models.decode_result import DecodeResult
 from models.error_result import VisionErrorResult
 from models.frame import FrameData
-from parser.asset_id_parser import AssetIdParser
+from parser.asset_id_parser import AssetIdParser, is_formal_asset_id
 from parser.deduplicator import ScanResultDeduplicator
 from parser.normalizer import FormalScanResultBuilder, ScanResultNormalizer
 from parser.stub import MockScanResultBuilder
@@ -44,6 +44,21 @@ class ParserTests(unittest.TestCase):
     def test_asset_id_parser_rejects_illegal_raw_text(self) -> None:
         parser = AssetIdParser()
         self.assertIsNone(parser.parse("borrow asset 3003 please"))
+
+    def test_asset_id_parser_normalizes_safe_underscore_and_space_variants(self) -> None:
+        parser = AssetIdParser()
+        self.assertEqual(parser.parse("asset_id=as_3010"), "AS-3010")
+        self.assertEqual(parser.parse("ID: AS 3011"), "AS-3011")
+
+    def test_asset_id_parser_rejects_asset_like_prose_without_explicit_structure(self) -> None:
+        parser = AssetIdParser()
+        self.assertIsNone(parser.parse("borrow AS 3012 please"))
+
+    def test_asset_id_submit_legality_checker_is_strict(self) -> None:
+        self.assertTrue(is_formal_asset_id("AS-3012"))
+        self.assertFalse(is_formal_asset_id("borrow AS 3012 please"))
+        self.assertFalse(is_formal_asset_id("ASSET"))
+        self.assertFalse(is_formal_asset_id("AS-XYZ"))
 
     def test_normalizer_preserves_formal_fields(self) -> None:
         normalizer = ScanResultNormalizer()
@@ -88,6 +103,27 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             second.to_submit_request()
 
+    def test_deduplicator_time_window_key_includes_source_id(self) -> None:
+        deduplicator = ScanResultDeduplicator(DedupConfig())
+        normalizer = ScanResultNormalizer()
+        first = normalizer.normalize(
+            FrameData(frame_id="frame-s1", image=b"x", timestamp=1700000100, source_id="webcam-0"),
+            DecodeResult(raw_text="AS-3014", symbology="QR"),
+            "AS-3014",
+        )
+        second = normalizer.normalize(
+            FrameData(frame_id="frame-s2", image=b"x", timestamp=1700000101, source_id="webcam-1"),
+            DecodeResult(raw_text="AS-3014", symbology="QR"),
+            "AS-3014",
+        )
+
+        first_result = deduplicator.apply(first)
+        second_result = deduplicator.apply(second)
+
+        self.assertFalse(first_result.is_duplicate)
+        self.assertFalse(second_result.is_duplicate)
+        self.assertIsNone(second_result.duplicate_reason)
+
     def test_formal_scan_result_builder_reports_parse_failure(self) -> None:
         builder = FormalScanResultBuilder(
             asset_id_parser=AssetIdParser(),
@@ -99,6 +135,7 @@ class ParserTests(unittest.TestCase):
 
         self.assertIsInstance(result, VisionErrorResult)
         self.assertEqual(result.error_code, "ASSET_ID_PARSE_FAILED")
+        self.assertEqual(result.extra["classifier"], "parse_fail")
 
     def test_formal_scan_result_builder_reports_multi_asset_conflict(self) -> None:
         builder = FormalScanResultBuilder(
@@ -117,6 +154,7 @@ class ParserTests(unittest.TestCase):
 
         self.assertIsInstance(result, VisionErrorResult)
         self.assertEqual(result.error_code, "MULTI_RESULT_CONFLICT")
+        self.assertEqual(result.extra["classifier"], "conflict")
 
     def test_formal_scan_result_builder_accepts_multiple_raw_texts_normalized_to_same_asset(self) -> None:
         builder = FormalScanResultBuilder(
@@ -135,6 +173,48 @@ class ParserTests(unittest.TestCase):
 
         self.assertEqual(result.asset_id, "AS-3009")
         self.assertFalse(result.is_duplicate)
+
+    def test_formal_scan_result_builder_prefers_earlier_decode_stage_for_same_asset(self) -> None:
+        builder = FormalScanResultBuilder(
+            asset_id_parser=AssetIdParser(),
+            normalizer=ScanResultNormalizer(),
+            deduplicator=ScanResultDeduplicator(DedupConfig()),
+        )
+
+        result = builder.build(
+            self.frame,
+            [
+                DecodeResult(
+                    raw_text="AS-3013",
+                    symbology="CODE128",
+                    confidence=0.99,
+                    extra={"decode_stage_rank": 2, "decode_stage": "full_enhanced"},
+                ),
+                DecodeResult(
+                    raw_text="asset_id: AS-3013",
+                    symbology="QR",
+                    confidence=0.5,
+                    extra={"decode_stage_rank": 0, "decode_stage": "roi_original"},
+                ),
+            ],
+        )
+
+        self.assertEqual(result.asset_id, "AS-3013")
+        self.assertEqual(result.raw_text, "asset_id: AS-3013")
+        self.assertEqual(result.extra["decode_stage"], "roi_original")
+
+    def test_formal_scan_result_builder_marks_no_code_with_stable_classifier(self) -> None:
+        builder = FormalScanResultBuilder(
+            asset_id_parser=AssetIdParser(),
+            normalizer=ScanResultNormalizer(),
+            deduplicator=ScanResultDeduplicator(DedupConfig()),
+        )
+
+        result = builder.build(self.frame, [])
+
+        self.assertIsInstance(result, VisionErrorResult)
+        self.assertEqual(result.error_code, "NO_CODE")
+        self.assertEqual(result.extra["classifier"], "no_code")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from capture.base import (
@@ -15,14 +15,16 @@ from decoder.base import Decoder, DecoderDependencyError, DecoderError
 from gateway.api_client import APIClient, SubmitResult
 from models.decode_result import DecodeResult
 from models.error_result import VisionErrorResult
-from models.frame import FrameData
+from models.frame import FrameData, strip_transient_frame_data
 from models.scan_result import ScanResult, ScanSubmitRequest
+from parser.asset_id_parser import is_formal_asset_id
 from parser.base import ScanResultBuilder
 from preprocess.quality_check import PreprocessDependencyError, PreprocessError, QualityGateError
 
 
 FramePreprocessor = Callable[[FrameData], FrameData]
 LOGGER = logging.getLogger(__name__)
+_REQUIRED_SUBMIT_FIELDS = ("asset_id", "raw_text", "symbology", "source_id")
 
 
 def _identity_preprocess(frame: FrameData) -> FrameData:
@@ -50,6 +52,10 @@ class PipelineRunOutput:
     conflict_count: int = 0
     submit_success_count: int = 0
     submit_fail_count: int = 0
+    transport_fail_count: int = 0
+    http_fail_count: int = 0
+    protocol_fail_count: int = 0
+    business_fail_count: int = 0
     reconnect_attempt_count: int = 0
     reconnect_success_count: int = 0
     reconnect_fail_count: int = 0
@@ -150,6 +156,7 @@ class VisionPipeline:
                     message=str(exc),
                     frame_id=frame.frame_id,
                     source_id=frame.source_id,
+                    extra=getattr(exc, "details", {}),
                 ),
             )
         except PreprocessError as exc:
@@ -168,6 +175,7 @@ class VisionPipeline:
                     message=str(exc),
                     frame_id=frame.frame_id,
                     source_id=frame.source_id,
+                    extra=getattr(exc, "details", {}),
                 ),
             )
         LOGGER.info(
@@ -189,7 +197,7 @@ class VisionPipeline:
             )
             return PipelineRunOutput(
                 status="failed",
-                frame=processed,
+                frame=strip_transient_frame_data(processed),
                 error=VisionErrorResult(
                     stage="decoder",
                     error_code="DECODER_DEPENDENCY_MISSING",
@@ -207,7 +215,7 @@ class VisionPipeline:
             )
             return PipelineRunOutput(
                 status="failed",
-                frame=processed,
+                frame=strip_transient_frame_data(processed),
                 error=VisionErrorResult(
                     stage="decoder",
                     error_code="DECODE_FAILED",
@@ -224,7 +232,7 @@ class VisionPipeline:
             )
             return PipelineRunOutput(
                 status="failed",
-                frame=processed,
+                frame=strip_transient_frame_data(processed),
                 error=VisionErrorResult(
                     stage="decoder",
                     error_code="DECODE_FAILED",
@@ -235,6 +243,7 @@ class VisionPipeline:
             )
 
         decode_results = tuple(decoded)
+        processed_for_parser = strip_transient_frame_data(processed)
         LOGGER.info(
             "decode ok frame_id=%s source_id=%s result_count=%s raw_texts=%s symbologies=%s decoder_names=%s",
             processed.frame_id,
@@ -245,7 +254,7 @@ class VisionPipeline:
             [item.decoder_name for item in decode_results],
         )
         try:
-            scan_result = self._scan_result_builder.build(processed, decode_results)
+            scan_result = self._scan_result_builder.build(processed_for_parser, decode_results)
         except Exception as exc:
             LOGGER.exception(
                 "parser unexpected_failure frame_id=%s source_id=%s",
@@ -320,6 +329,23 @@ class VisionPipeline:
                 scan_result=scan_result,
             )
 
+        validation_error = self._validate_scan_result_for_submit(scan_result)
+        if validation_error is not None:
+            LOGGER.warning(
+                "submit_request invalid frame_id=%s source_id=%s asset_id=%s errors=%s",
+                scan_result.frame_id,
+                scan_result.source_id,
+                scan_result.asset_id,
+                validation_error.extra.get("validation_errors"),
+            )
+            return PipelineRunOutput(
+                status="failed",
+                frame=frame,
+                decode_results=decode_results,
+                scan_result=scan_result,
+                error=validation_error,
+            )
+
         try:
             submit_request = scan_result.to_submit_request()
         except Exception as exc:
@@ -345,6 +371,7 @@ class VisionPipeline:
             )
         submit_result = self._api_client.submit(submit_request)
         if not submit_result.business_success:
+            submit_error = self._build_submit_failure_error(scan_result, submit_result)
             LOGGER.warning(
                 "submit failed frame_id=%s source_id=%s asset_id=%s status=%s http_status=%s code=%s message=%s",
                 submit_request.frame_id,
@@ -362,7 +389,7 @@ class VisionPipeline:
                 scan_result=scan_result,
                 submit_request=submit_request,
                 submit_result=submit_result,
-                error=submit_result.error,
+                error=submit_error,
             )
         LOGGER.info(
             "submit ok frame_id=%s source_id=%s asset_id=%s code=%s message=%s",
@@ -381,3 +408,70 @@ class VisionPipeline:
             submit_request=submit_request,
             submit_result=submit_result,
         )
+
+    def _validate_scan_result_for_submit(self, scan_result: ScanResult) -> VisionErrorResult | None:
+        validation_errors: list[str] = []
+        for field_name in _REQUIRED_SUBMIT_FIELDS:
+            value = getattr(scan_result, field_name, None)
+            if not isinstance(value, str) or not value.strip():
+                validation_errors.append(f"missing_or_blank:{field_name}")
+        if not isinstance(scan_result.frame_time, int):
+            validation_errors.append("invalid_type:frame_time")
+        elif scan_result.frame_time <= 0 or scan_result.frame_time >= 10_000_000_000:
+            validation_errors.append("invalid_value:frame_time")
+        if not is_formal_asset_id(scan_result.asset_id):
+            validation_errors.append("invalid_asset_id")
+        if validation_errors:
+            return VisionErrorResult(
+                stage="pipeline",
+                error_code="INVALID_SUBMIT_REQUEST",
+                message="scan result failed pre-submit validation",
+                frame_id=scan_result.frame_id,
+                source_id=scan_result.source_id,
+                extra={
+                    "classifier": "parse_fail",
+                    "validation_errors": tuple(validation_errors),
+                },
+            )
+        return None
+
+    def _build_submit_failure_error(
+        self,
+        scan_result: ScanResult,
+        submit_result: SubmitResult,
+    ) -> VisionErrorResult:
+        failure_kind = self._classify_submit_failure(submit_result)
+        error = submit_result.error or VisionErrorResult(
+            stage="gateway",
+            error_code=submit_result.code,
+            message=submit_result.message,
+            frame_id=scan_result.frame_id,
+            source_id=scan_result.source_id,
+        )
+        extra = dict(error.extra)
+        extra.update(
+            {
+                "classifier": "submit_fail",
+                "submit_status": submit_result.status,
+                "submit_failure_kind": failure_kind,
+                "transport_success": submit_result.transport_success,
+                "http_ok": submit_result.http_ok,
+                "response_valid": submit_result.response_valid,
+                "business_success": submit_result.business_success,
+            }
+        )
+        return replace(
+            error,
+            frame_id=error.frame_id or scan_result.frame_id,
+            source_id=error.source_id or scan_result.source_id,
+            extra=extra,
+        )
+
+    def _classify_submit_failure(self, submit_result: SubmitResult) -> str:
+        if not submit_result.transport_success:
+            return "transport"
+        if not submit_result.http_ok:
+            return "http"
+        if not submit_result.response_valid:
+            return "protocol"
+        return "business"

@@ -36,6 +36,45 @@ class ReturnRequestBody(BaseModel):
         return _strip_required_text(value)
 
 
+class InboundRequestBody(BaseModel):
+    asset_id: str = Field(..., description="Asset ID")
+    user_id: str = Field(..., description="User ID")
+    user_name: str = Field(..., description="User name")
+    asset_name: str = Field(..., description="Asset name")
+    category_id: int | None = Field(None, description="Category ID")
+    location: str = Field(..., description="Storage location")
+    raw_text: str | None = Field(None, description="Original scan text")
+    symbology: str | None = Field(None, description="Scan code format")
+    timeout_ms: int = Field(30000, gt=0, description="Hardware wait timeout in milliseconds")
+
+
+class BorrowRequestCreateBody(BaseModel):
+    asset_id: str = Field(..., description="Asset ID")
+    user_id: str = Field(..., description="Applicant user ID")
+    user_name: str = Field(..., description="Applicant user name")
+    reason: str | None = Field(None, description="Borrow request reason")
+
+    @field_validator("asset_id", "user_id", "user_name")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class BorrowRequestReviewBody(BaseModel):
+    reviewer_user_id: str = Field(..., description="Reviewer user ID")
+    reviewer_user_name: str = Field(..., description="Reviewer user name")
+    review_comment: str | None = Field(None, description="Review comment")
+
+    @field_validator("reviewer_user_id", "reviewer_user_name")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _strip_required_text(value)
+
+
+class BorrowRequestStartBorrowBody(BaseModel):
+    timeout_ms: int = Field(30000, gt=0, description="Hardware wait timeout in milliseconds")
+
+
 class ScanResultRequestBody(BaseModel):
     asset_id: str = Field(..., description="Asset ID from the scan result")
 
@@ -64,6 +103,28 @@ class BusinessResultResponse(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class BorrowRequestRecordResponse(BaseModel):
+    request_id: str
+    asset_id: str
+    applicant_user_id: str
+    applicant_user_name: str
+    reason: str | None = None
+    status: str
+    reviewer_user_id: str | None = None
+    reviewer_user_name: str | None = None
+    review_comment: str | None = None
+    requested_at: str | None = None
+    reviewed_at: str | None = None
+    consumed_at: str | None = None
+
+
+class BorrowRequestActionResponse(BaseModel):
+    success: bool
+    code: str
+    message: str
+    item: BorrowRequestRecordResponse | None = None
+
+
 class AssetSnapshotResponse(BaseModel):
     asset_id: str
     exists: bool
@@ -73,10 +134,11 @@ class AssetSnapshotResponse(BaseModel):
 
 
 class ScanResultResponse(BaseModel):
-    asset_id: str
-    exists: bool
-    asset_status: str | None = None
-    device_status: str
+    success: bool
+    code: str
+    message: str
+    asset_id: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):

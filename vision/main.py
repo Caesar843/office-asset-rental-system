@@ -10,7 +10,7 @@ from app.runner import build_runner
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Vision module round-5 runner")
+    parser = argparse.ArgumentParser(description="Vision module runner")
     parser.add_argument("--run-mode", choices=("mock", "live"), default="mock")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--source-type", default="webcam")
@@ -28,9 +28,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--read-failure-tolerance", type=int, default=2)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--max-duration-sec", type=int)
+    parser.add_argument("--max-frames", type=int)
     parser.add_argument("--soak", action="store_true")
     parser.add_argument("--soak-duration-sec", type=int)
     parser.add_argument("--soak-max-frames", type=int)
+    parser.add_argument("--no-summary-on-exit", action="store_true")
     parser.add_argument("--show-preview", action="store_true")
     parser.add_argument("--debug-mode", action="store_true")
     parser.add_argument("--strict-preview", action="store_true")
@@ -58,7 +61,9 @@ def _coerce_source_value(source_type: str, raw_value: str | None) -> int | str:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    soak_enabled = args.soak or args.soak_duration_sec is not None or args.soak_max_frames is not None
+    duration_limit = args.max_duration_sec if args.max_duration_sec is not None else args.soak_duration_sec
+    frame_limit = args.max_frames if args.max_frames is not None else args.soak_max_frames
+    soak_enabled = args.soak or duration_limit is not None or frame_limit is not None
     single_run = not (args.continuous or soak_enabled)
     try:
         config = VisionConfig.from_overrides(
@@ -88,9 +93,10 @@ def main(argv: list[str] | None = None) -> int:
                 "preview_overlay_enabled": not args.disable_preview_overlay,
                 "event_history_size": args.event_history_size,
                 "summary_include_recent_events": not args.no_recent_events,
+                "summary_on_exit": not args.no_summary_on_exit,
                 "soak_enabled": soak_enabled,
-                "soak_duration_sec": args.soak_duration_sec,
-                "soak_max_frames": args.soak_max_frames,
+                "max_duration_sec": duration_limit,
+                "max_frames": frame_limit,
                 "summary_json_path": args.summary_json_path,
                 "event_export_path": args.event_export_path,
                 "health_logging_enabled": not args.disable_health_logging,
@@ -116,7 +122,8 @@ def main(argv: list[str] | None = None) -> int:
             f"message={result.submit_result.message} "
             f"asset_id={result.submit_result.response_payload.get('asset_id')}"
         )
-        print(summary_text)
+        if config.runtime.summary_on_exit:
+            print(summary_text)
         return 0
 
     if result.error is not None:
@@ -129,7 +136,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print(f"runner finished with status={result.status}", file=sys.stderr)
-    print(summary_text, file=sys.stderr)
+    if config.runtime.summary_on_exit:
+        print(summary_text, file=sys.stderr)
     return 1
 
 

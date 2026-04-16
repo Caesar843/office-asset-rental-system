@@ -1,0 +1,2075 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>办公室资产租借系统</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Microsoft YaHei', sans-serif;
+            background-color: #e6f7ff;
+            color: #333;
+            background-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100"><circle cx="50" cy="50" r="5" fill="#b3e0ff" opacity="0.5"/></svg>');
+            background-size: 50px 50px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            color: #1890ff;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+            font-size: 36px;
+        }
+
+        .emoji {
+            font-size: 48px;
+            margin-right: 10px;
+        }
+
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            background-color: #fff;
+            border-radius: 20px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 15px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-radius: 20px;
+            font-weight: bold;
+            color: #666;
+        }
+
+        .tab.active {
+            background-color: #1890ff;
+            color: #fff;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 10px rgba(24, 144, 255, 0.3);
+        }
+
+        .tab:hover {
+            background-color: #bae7ff;
+            transform: translateY(-2px);
+        }
+
+        .tab.active:hover {
+            background-color: #096dd9;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .content {
+            background-color: #fff;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .form-group {
+            margin-bottom: 25px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #1890ff;
+            font-size: 18px;
+        }
+
+        input,
+        select {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #b3e0ff;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: all 0.3s;
+            background-color: #fff;
+        }
+
+        input:focus,
+        select:focus {
+            outline: none;
+            border-color: #1890ff;
+            box-shadow: 0 0 10px rgba(24, 144, 255, 0.2);
+        }
+
+        button {
+            background-color: #1890ff;
+            color: #fff;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 20px;
+            font-size: 18px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+            box-shadow: 0 4px 10px rgba(24, 144, 255, 0.3);
+        }
+
+        button:hover {
+            background-color: #096dd9;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 15px rgba(24, 144, 255, 0.4);
+        }
+
+        button:active {
+            transform: translateY(0);
+        }
+
+        button:disabled {
+            opacity: 0.65;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 10px;
+            font-weight: bold;
+        }
+
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 2px solid #c3e6cb;
+        }
+
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 2px solid #f5c6cb;
+        }
+
+        .status.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 2px solid #bee5eb;
+        }
+
+        .asset-list {
+            margin-top: 20px;
+        }
+
+        .asset-item {
+            padding: 20px;
+            border-bottom: 2px solid #b3e0ff;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            background-color: #fff;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.05);
+        }
+
+        .asset-item:last-child {
+            border-bottom: none;
+        }
+
+        .asset-status {
+            display: inline-block;
+            padding: 8px 15px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        .status-in-stock {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .status-borrowed {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+
+        .status-maintenance {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        .status-scrapped {
+            background-color: #e2e3e5;
+            color: #383d41;
+        }
+
+        .dashboard-toolbar {
+            display: flex;
+            gap: 15px;
+            align-items: end;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .dashboard-toolbar .form-group {
+            flex: 1;
+            min-width: 220px;
+            margin-bottom: 0;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .dashboard-card,
+        .dashboard-panel {
+            background-color: #fff;
+            border: 2px solid #b3e0ff;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+        }
+
+        .dashboard-card h3,
+        .dashboard-panel h3 {
+            color: #1890ff;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+
+        .dashboard-value {
+            font-size: 30px;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .dashboard-list-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #e6f7ff;
+        }
+
+        .dashboard-list-item:last-child {
+            border-bottom: none;
+        }
+
+        .dashboard-empty {
+            color: #666;
+            padding: 10px 0;
+        }
+
+        .dashboard-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .dashboard-actions button {
+            padding: 12px 18px;
+            font-size: 16px;
+        }
+
+        .records-toolbar {
+            display: flex;
+            gap: 15px;
+            align-items: end;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .records-toolbar .form-group {
+            flex: 1;
+            min-width: 180px;
+            margin-bottom: 0;
+        }
+
+        .records-list {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .record-item {
+            background-color: #fff;
+            border: 2px solid #b3e0ff;
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+        }
+
+        .record-item h3 {
+            color: #1890ff;
+            margin-bottom: 12px;
+            font-size: 20px;
+        }
+
+        .record-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px 20px;
+        }
+
+        .record-grid p {
+            margin: 0;
+            line-height: 1.6;
+            word-break: break-word;
+        }
+
+        .records-summary {
+            margin-bottom: 15px;
+            color: #1890ff;
+            font-weight: bold;
+        }
+
+        #status-messages {
+            margin-top: 20px;
+            padding: 20px;
+            background-color: #fff;
+            border-radius: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .status-message {
+            margin-bottom: 10px;
+            padding: 15px;
+            border-radius: 10px;
+        }
+
+        .message-info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .message-success {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .message-error {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 12px;
+            }
+
+            h1 {
+                font-size: 28px;
+                margin-bottom: 20px;
+            }
+
+            .tabs {
+                flex-wrap: wrap;
+                border-radius: 16px;
+            }
+
+            .tab {
+                flex: 1 1 calc(50% - 2px);
+                min-width: 140px;
+                padding: 14px 10px;
+            }
+
+            .content {
+                padding: 20px;
+            }
+
+            .dashboard-toolbar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .dashboard-toolbar .form-group,
+            .dashboard-actions {
+                width: 100%;
+                min-width: 0;
+            }
+
+            .records-toolbar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .records-toolbar .form-group {
+                width: 100%;
+                min-width: 0;
+            }
+
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .dashboard-list-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 6px;
+            }
+
+            .record-grid {
+                grid-template-columns: 1fr;
+            }
+
+            button {
+                width: 100%;
+            }
+
+            .asset-item,
+            .dashboard-card,
+            .dashboard-panel,
+            .record-item,
+            .status,
+            .status-message {
+                padding: 16px;
+                word-break: break-word;
+            }
+
+            #status-messages {
+                padding: 15px;
+                max-height: 240px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>办公室资产租借系统</h1>
+
+        <div class="tabs">
+            <div class="tab active" data-tab="borrow">借出资产</div>
+            <div class="tab" data-tab="return">归还资产</div>
+            <div class="tab" data-tab="inbound">入库操作</div>
+            <div class="tab" data-tab="assets">资产列表</div>
+            <div class="tab" data-tab="dashboard">看板统计</div>
+            <div class="tab" data-tab="records">操作记录</div>
+            <div class="tab" data-tab="asset-changes">资产变更</div>
+            <div class="tab" data-tab="exceptions">异常记录</div>
+            <div class="tab" data-tab="scan">扫码识别</div>
+        </div>
+
+        <div class="content">
+            <!-- 借出资产 -->
+            <div id="borrow" class="tab-content active">
+                <div class="form-group">
+                    <label for="borrow-asset-id">资产ID</label>
+                    <input type="text" id="borrow-asset-id" placeholder="例如: AS-0924">
+                </div>
+                <div class="form-group">
+                    <label for="borrow-user-id">用户ID</label>
+                    <input type="text" id="borrow-user-id" placeholder="例如: U-1001">
+                </div>
+                <div class="form-group">
+                    <label for="borrow-user-name">用户姓名</label>
+                    <input type="text" id="borrow-user-name" placeholder="例如: 张三">
+                </div>
+                <button onclick="borrowAsset()">确认借出</button>
+                <div id="borrow-status" class="status"></div>
+            </div>
+
+            <!-- 归还资产 -->
+            <div id="return" class="tab-content">
+                <div class="form-group">
+                    <label for="return-asset-id">资产ID</label>
+                    <input type="text" id="return-asset-id" placeholder="例如: AS-0924">
+                </div>
+                <div class="form-group">
+                    <label for="return-user-id">用户ID</label>
+                    <input type="text" id="return-user-id" placeholder="例如: U-1001">
+                </div>
+                <div class="form-group">
+                    <label for="return-user-name">用户姓名</label>
+                    <input type="text" id="return-user-name" placeholder="例如: 张三">
+                </div>
+                <button onclick="returnAsset()">确认归还</button>
+                <div id="return-status" class="status"></div>
+            </div>
+
+            <!-- 入库操作 -->
+            <div id="inbound" class="tab-content">
+                <div id="inbound-scan-status" class="status info">待填写：可先在“扫码识别”页带入资产ID，也可直接手工录入。</div>
+                <div class="form-group">
+                    <label for="inbound-asset-id">资产ID</label>
+                    <input type="text" id="inbound-asset-id" placeholder="例如: AS-2001">
+                </div>
+                <div class="form-group">
+                    <label for="inbound-asset-name">资产名称</label>
+                    <input type="text" id="inbound-asset-name" placeholder="例如: ThinkPad X1 Carbon">
+                </div>
+                <div class="form-group">
+                    <label for="inbound-category-id">分类ID</label>
+                    <input type="number" id="inbound-category-id" min="1" placeholder="例如: 1">
+                </div>
+                <div class="form-group">
+                    <label for="inbound-location">存放位置</label>
+                    <input type="text" id="inbound-location" placeholder="例如: Cabinet A">
+                </div>
+                <div class="form-group">
+                    <label for="inbound-user-id">管理员ID</label>
+                    <input type="text" id="inbound-user-id" value="U-ADMIN" placeholder="例如: U-ADMIN">
+                </div>
+                <div class="form-group">
+                    <label for="inbound-user-name">管理员姓名</label>
+                    <input type="text" id="inbound-user-name" value="管理员" placeholder="例如: 管理员">
+                </div>
+                <button id="inbound-submit-button" onclick="submitInbound()">发起入库</button>
+                <div id="inbound-status" class="status info">待填写：请补全资产名称、位置和管理员信息。</div>
+            </div>
+
+            <!-- 资产列表 -->
+            <div id="assets" class="tab-content">
+                <div class="asset-list" id="asset-list"></div>
+            </div>
+
+            <!-- 看板统计 -->
+            <div id="dashboard" class="tab-content">
+                <div class="dashboard-toolbar">
+                    <div class="form-group">
+                        <label for="dashboard-time-range">时间范围</label>
+                        <select id="dashboard-time-range" onchange="loadDashboard()">
+                            <option value="all">全部</option>
+                            <option value="today">今天</option>
+                            <option value="7d">近 7 天</option>
+                            <option value="30d">近 30 天</option>
+                        </select>
+                    </div>
+                    <div class="dashboard-actions">
+                        <button type="button" onclick="downloadAssetsExport()">导出资产台账</button>
+                        <button type="button" onclick="downloadOperationsExport()">导出借还记录</button>
+                        <button type="button" onclick="downloadDashboardExport()">导出看板统计</button>
+                    </div>
+                </div>
+                <div class="dashboard-grid" id="dashboard-summary"></div>
+                <div class="dashboard-grid" id="dashboard-operation-stats"></div>
+                <div class="dashboard-panel">
+                    <h3>借用频次排行</h3>
+                    <div id="dashboard-borrow-top"></div>
+                </div>
+                <div id="dashboard-status"></div>
+            </div>
+
+            <!-- 操作记录 -->
+            <div id="records" class="tab-content">
+                <div class="records-toolbar">
+                    <div class="form-group">
+                        <label for="records-asset-id">资产ID</label>
+                        <input type="text" id="records-asset-id" placeholder="例如: AS-0924">
+                    </div>
+                    <div class="form-group">
+                        <label for="records-action-type">操作类型</label>
+                        <select id="records-action-type">
+                            <option value="">全部</option>
+                            <option value="BORROW">BORROW</option>
+                            <option value="RETURN">RETURN</option>
+                            <option value="INBOUND">INBOUND</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="records-time-range">时间范围</label>
+                        <select id="records-time-range">
+                            <option value="all">全部</option>
+                            <option value="today">今天</option>
+                            <option value="7d">近 7 天</option>
+                            <option value="30d">近 30 天</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="loadRecords()">查询记录</button>
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="downloadFilteredRecordsExport()">导出当前记录</button>
+                    </div>
+                </div>
+                <div class="records-summary" id="records-summary"></div>
+                <div class="records-list" id="records-list"></div>
+                <div id="records-status"></div>
+            </div>
+
+            <!-- 资产变更 -->
+            <div id="asset-changes" class="tab-content">
+                <div class="records-toolbar">
+                    <div class="form-group">
+                        <label for="asset-changes-asset-id">资产ID</label>
+                        <input type="text" id="asset-changes-asset-id" placeholder="例如: AS-0924">
+                    </div>
+                    <div class="form-group">
+                        <label for="asset-changes-action-type">操作类型</label>
+                        <select id="asset-changes-action-type">
+                            <option value="">全部</option>
+                            <option value="BORROW">BORROW</option>
+                            <option value="RETURN">RETURN</option>
+                            <option value="INBOUND">INBOUND</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="asset-changes-time-range">时间范围</label>
+                        <select id="asset-changes-time-range">
+                            <option value="all">全部</option>
+                            <option value="today">今天</option>
+                            <option value="7d">近 7 天</option>
+                            <option value="30d">近 30 天</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="loadAssetChanges()">查询变更</button>
+                    </div>
+                </div>
+                <div class="records-summary" id="asset-changes-summary"></div>
+                <div class="records-list" id="asset-changes-list"></div>
+                <div id="asset-changes-status"></div>
+            </div>
+
+            <!-- 异常记录 -->
+            <div id="exceptions" class="tab-content">
+                <div class="records-toolbar">
+                    <div class="form-group">
+                        <label for="exceptions-asset-id">资产ID</label>
+                        <input type="text" id="exceptions-asset-id" placeholder="例如: AS-0924">
+                    </div>
+                    <div class="form-group">
+                        <label for="exceptions-action-type">操作类型</label>
+                        <select id="exceptions-action-type">
+                            <option value="">全部</option>
+                            <option value="BORROW">BORROW</option>
+                            <option value="RETURN">RETURN</option>
+                            <option value="INBOUND">INBOUND</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="exceptions-code">异常码</label>
+                        <select id="exceptions-code">
+                            <option value="">全部</option>
+                            <option value="DEVICE_OFFLINE">DEVICE_OFFLINE</option>
+                            <option value="ASSET_NOT_FOUND">ASSET_NOT_FOUND</option>
+                            <option value="STATE_INVALID">STATE_INVALID</option>
+                            <option value="PERMISSION_DENIED">PERMISSION_DENIED</option>
+                            <option value="PARAM_INVALID">PARAM_INVALID</option>
+                            <option value="BUSY">BUSY</option>
+                            <option value="INTERNAL_ERROR">INTERNAL_ERROR</option>
+                            <option value="ACK_TIMEOUT">ACK_TIMEOUT</option>
+                            <option value="HW_RESULT_TIMEOUT">HW_RESULT_TIMEOUT</option>
+                            <option value="CANCELLED">CANCELLED</option>
+                            <option value="TIMEOUT">TIMEOUT</option>
+                            <option value="ACK_ERROR">ACK_ERROR</option>
+                            <option value="ACK_INVALID">ACK_INVALID</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="exceptions-time-range">时间范围</label>
+                        <select id="exceptions-time-range">
+                            <option value="all">全部</option>
+                            <option value="today">今天</option>
+                            <option value="7d">近 7 天</option>
+                            <option value="30d">近 30 天</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="loadExceptions()">查询异常</button>
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="downloadFilteredExceptionsExport()">导出当前异常记录</button>
+                    </div>
+                </div>
+                <div class="records-summary" id="exceptions-summary"></div>
+                <div class="records-list" id="exceptions-list"></div>
+                <div id="exceptions-status"></div>
+            </div>
+
+            <!-- 扫码识别 -->
+            <div id="scan" class="tab-content">
+                <div class="form-group">
+                    <label for="scan-result">扫描结果</label>
+                    <input type="text" id="scan-result" placeholder="扫描二维码或条码">
+                </div>
+                <button onclick="submitScanResult()">提交扫描结果</button>
+                <div id="scan-status" class="status"></div>
+            </div>
+        </div>
+
+        <div id="status-messages"></div>
+    </div>
+
+    <script>
+        const API_BASE_URL = '';
+        let ws = null;
+        let activeTabId = 'borrow';
+        let lastScanBinding = null;
+        let activeInboundContext = null;
+        let activeBorrowApprovalContext = null;
+        let inboundRefreshPromise = null;
+        const INBOUND_DEMO_USER_ID = 'U-ADMIN';
+        const INBOUND_DEMO_USER_NAME = '管理员';
+        const INBOUND_FAILURE_CODES = new Set([
+            'BUSY',
+            'DEVICE_OFFLINE',
+            'STATE_INVALID',
+            'PERMISSION_DENIED',
+            'PARAM_INVALID',
+            'INTERNAL_ERROR',
+            'ACK_TIMEOUT',
+            'HW_RESULT_TIMEOUT',
+            'CANCELLED',
+            'TIMEOUT',
+            'ACK_ERROR',
+            'ACK_INVALID',
+        ]);
+        const APPROVAL_DEMO_USER_ID = 'U-ADMIN';
+        const APPROVAL_DEMO_USER_NAME = '管理员';
+        const BORROW_FAILURE_CODES = new Set([
+            'BUSY',
+            'DEVICE_OFFLINE',
+            'STATE_INVALID',
+            'ASSET_NOT_FOUND',
+            'INTERNAL_ERROR',
+            'ACK_TIMEOUT',
+            'HW_RESULT_TIMEOUT',
+            'CANCELLED',
+            'TIMEOUT',
+            'ACK_ERROR',
+            'ACK_INVALID',
+        ]);
+
+        function setupBorrowRequestPages() {
+            const tabsContainer = document.querySelector('.tabs');
+            const borrowTabButton = tabsContainer ? tabsContainer.querySelector('[data-tab="borrow"]') : null;
+            if (borrowTabButton) {
+                borrowTabButton.textContent = '借用申请';
+            }
+
+            if (tabsContainer && !tabsContainer.querySelector('[data-tab="approvals"]')) {
+                const approvalsTabButton = document.createElement('div');
+                approvalsTabButton.className = 'tab';
+                approvalsTabButton.setAttribute('data-tab', 'approvals');
+                approvalsTabButton.textContent = '审批管理';
+                const returnTabButton = tabsContainer.querySelector('[data-tab="return"]');
+                if (returnTabButton) {
+                    tabsContainer.insertBefore(approvalsTabButton, returnTabButton);
+                } else {
+                    tabsContainer.appendChild(approvalsTabButton);
+                }
+            }
+
+            const borrowPanel = document.getElementById('borrow');
+            if (borrowPanel) {
+                borrowPanel.innerHTML = `
+                    <div class="form-group">
+                        <label for="borrow-request-asset-id">资产ID</label>
+                        <input type="text" id="borrow-request-asset-id" placeholder="例如: AS-0924">
+                    </div>
+                    <div class="form-group">
+                        <label for="borrow-request-user-id">借用人ID</label>
+                        <input type="text" id="borrow-request-user-id" value="U-1001" placeholder="例如: U-1001">
+                    </div>
+                    <div class="form-group">
+                        <label for="borrow-request-user-name">借用人姓名</label>
+                        <input type="text" id="borrow-request-user-name" value="张三" placeholder="例如: 张三">
+                    </div>
+                    <div class="form-group">
+                        <label for="borrow-request-reason">申请理由</label>
+                        <input type="text" id="borrow-request-reason" placeholder="例如: 外出答辩临时借用">
+                    </div>
+                    <button onclick="submitBorrowRequest()">提交借用申请</button>
+                    <div id="borrow-status" class="status info">填写资产和借用人信息后提交申请，等待管理员审批。</div>
+                    <div class="records-toolbar" style="margin-top: 20px;">
+                        <div class="form-group">
+                            <label for="borrow-request-filter-status">申请状态</label>
+                            <select id="borrow-request-filter-status">
+                                <option value="">全部</option>
+                                <option value="PENDING">PENDING</option>
+                                <option value="APPROVED">APPROVED</option>
+                                <option value="REJECTED">REJECTED</option>
+                                <option value="CONSUMED">CONSUMED</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <button type="button" onclick="loadBorrowRequests()">刷新申请记录</button>
+                        </div>
+                    </div>
+                    <div class="records-summary" id="borrow-requests-summary"></div>
+                    <div class="records-list" id="borrow-requests-list"></div>
+                `;
+            }
+
+            if (!document.getElementById('approvals')) {
+                const approvalsPanel = document.createElement('div');
+                approvalsPanel.id = 'approvals';
+                approvalsPanel.className = 'tab-content';
+                approvalsPanel.innerHTML = `
+                    <div class="records-toolbar">
+                        <div class="form-group">
+                            <label for="approval-filter-status">申请状态</label>
+                            <select id="approval-filter-status">
+                                <option value="PENDING">PENDING</option>
+                                <option value="APPROVED">APPROVED</option>
+                                <option value="REJECTED">REJECTED</option>
+                                <option value="CONSUMED">CONSUMED</option>
+                                <option value="">全部</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="approval-filter-asset-id">资产ID</label>
+                            <input type="text" id="approval-filter-asset-id" placeholder="例如: AS-0924">
+                        </div>
+                        <div class="form-group">
+                            <label for="approval-reviewer-user-id">管理员ID</label>
+                            <input type="text" id="approval-reviewer-user-id" value="U-ADMIN" placeholder="例如: U-ADMIN">
+                        </div>
+                        <div class="form-group">
+                            <label for="approval-reviewer-user-name">管理员姓名</label>
+                            <input type="text" id="approval-reviewer-user-name" value="管理员" placeholder="例如: 管理员">
+                        </div>
+                        <div class="form-group">
+                            <button type="button" onclick="loadBorrowApprovals()">刷新审批列表</button>
+                        </div>
+                    </div>
+                    <div id="approval-status" class="status info">可在此审批借用申请，并从已审批申请发起借出确认。</div>
+                    <div class="records-summary" id="approval-summary"></div>
+                    <div class="records-list" id="approval-list"></div>
+                `;
+
+                const returnPanel = document.getElementById('return');
+                if (returnPanel) {
+                    returnPanel.parentNode.insertBefore(approvalsPanel, returnPanel);
+                }
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            setupBorrowRequestPages();
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.addEventListener('click', () => setActiveTab(tab.getAttribute('data-tab')));
+            });
+
+            initializeInboundForm();
+            initWebSocket();
+            loadBorrowRequests();
+            loadBorrowApprovals();
+            loadAssets();
+            loadDashboard();
+        });
+
+        function setActiveTab(tabId) {
+            activeTabId = tabId;
+            document.querySelectorAll('.tab').forEach(tab => {
+                tab.classList.toggle('active', tab.getAttribute('data-tab') === tabId);
+            });
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.toggle('active', content.id === tabId);
+            });
+
+            if (tabId === 'borrow') {
+                loadBorrowRequests();
+            }
+
+            if (tabId === 'approvals') {
+                loadBorrowApprovals();
+            }
+
+            if (tabId === 'assets') {
+                loadAssets();
+            }
+
+            if (tabId === 'dashboard') {
+                loadDashboard();
+            }
+
+            if (tabId === 'records') {
+                loadRecords();
+            }
+
+            if (tabId === 'asset-changes') {
+                loadAssetChanges();
+            }
+
+            if (tabId === 'exceptions') {
+                loadExceptions();
+            }
+
+            if (tabId === 'inbound') {
+                updateInboundFormState();
+            }
+        }
+
+        function setStatusText(elementId, message, tone) {
+            const element = document.getElementById(elementId);
+            element.textContent = message;
+            element.className = `status ${tone}`;
+        }
+
+        function initializeInboundForm() {
+            const inboundUserId = document.getElementById('inbound-user-id');
+            const inboundUserName = document.getElementById('inbound-user-name');
+
+            if (!inboundUserId.value.trim()) {
+                inboundUserId.value = INBOUND_DEMO_USER_ID;
+            }
+            if (!inboundUserName.value.trim()) {
+                inboundUserName.value = INBOUND_DEMO_USER_NAME;
+            }
+
+            ['inbound-asset-id', 'inbound-asset-name', 'inbound-category-id', 'inbound-location', 'inbound-user-id', 'inbound-user-name']
+                .forEach(id => {
+                    document.getElementById(id).addEventListener('input', () => updateInboundFormState());
+                });
+
+            updateInboundFormState();
+        }
+
+        function updateInboundFormState() {
+            if (activeInboundContext && activeInboundContext.pending) {
+                return;
+            }
+
+            const assetId = document.getElementById('inbound-asset-id').value.trim();
+            const assetName = document.getElementById('inbound-asset-name').value.trim();
+            const location = document.getElementById('inbound-location').value.trim();
+            const userId = document.getElementById('inbound-user-id').value.trim();
+            const userName = document.getElementById('inbound-user-name').value.trim();
+
+            if (!assetId && !assetName && !location) {
+                setStatusText('inbound-status', '待填写：请先扫码或录入资产ID，再补全名称、位置和管理员信息。', 'info');
+                return;
+            }
+
+            if (assetId && assetName && location && userId && userName) {
+                setStatusText('inbound-status', '可提交：已补全必填信息，可发起入库确认。', 'info');
+                return;
+            }
+
+            setStatusText('inbound-status', '待填写：请补全入库必填信息。', 'info');
+        }
+
+        function getInboundRequestBody() {
+            const assetId = document.getElementById('inbound-asset-id').value.trim();
+            const assetName = document.getElementById('inbound-asset-name').value.trim();
+            const categoryRaw = document.getElementById('inbound-category-id').value.trim();
+            const location = document.getElementById('inbound-location').value.trim();
+            const userId = document.getElementById('inbound-user-id').value.trim();
+            const userName = document.getElementById('inbound-user-name').value.trim();
+            const categoryId = categoryRaw ? Number(categoryRaw) : null;
+            const rawText = lastScanBinding && lastScanBinding.assetId === assetId ? lastScanBinding.rawText : null;
+            const symbology = lastScanBinding && lastScanBinding.assetId === assetId ? lastScanBinding.symbology : null;
+
+            return {
+                asset_id: assetId,
+                user_id: userId,
+                user_name: userName,
+                asset_name: assetName,
+                category_id: categoryId,
+                location: location,
+                raw_text: rawText,
+                symbology: symbology,
+            };
+        }
+
+        function setInboundSubmitDisabled(disabled) {
+            document.getElementById('inbound-submit-button').disabled = disabled;
+        }
+
+        function bindScanResultToInbound(result, rawText) {
+            const assetId = (result.asset_id || '').trim();
+            if (!assetId) {
+                return;
+            }
+
+            document.getElementById('inbound-asset-id').value = assetId;
+            lastScanBinding = {
+                assetId: assetId,
+                rawText: rawText,
+                symbology: null,
+                code: result.code || '',
+                exists: Boolean(result.extra && result.extra.exists),
+                assetStatus: result.extra && result.extra.asset_status ? result.extra.asset_status : null,
+            };
+
+            if (lastScanBinding.exists) {
+                setStatusText(
+                    'inbound-scan-status',
+                    `扫码结果已带入入库页：${assetId}。当前系统中已存在该资产，若继续入库将由后端按正式规则拒绝。`,
+                    'info'
+                );
+            } else {
+                setStatusText(
+                    'inbound-scan-status',
+                    `扫码结果已带入入库页：${assetId}。当前资产尚未建档，可继续补全信息后发起入库。`,
+                    'info'
+                );
+            }
+
+            updateInboundFormState();
+            setActiveTab('inbound');
+        }
+
+        function resolveStatusTone(payload) {
+            if (!payload) {
+                return 'info';
+            }
+            if (payload.success === true || payload.code === 'CONFIRMED') {
+                return 'success';
+            }
+            if (payload.success === false || INBOUND_FAILURE_CODES.has(payload.code)) {
+                return 'error';
+            }
+            return 'info';
+        }
+
+        function addStatusMessage(payload) {
+            const statusMessages = document.getElementById('status-messages');
+            const messageDiv = document.createElement('div');
+            const tone = resolveStatusTone(payload);
+            const message = payload.message || payload.code || '状态更新';
+            messageDiv.className = `status-message message-${tone}`;
+            messageDiv.textContent = `${new Date().toLocaleString()}: ${message}`;
+            statusMessages.appendChild(messageDiv);
+            statusMessages.scrollTop = statusMessages.scrollHeight;
+        }
+
+        function shouldHandleInboundStatus(payload) {
+            if (payload.action_type !== 'INBOUND') {
+                return false;
+            }
+
+            if (!activeInboundContext) {
+                const currentAssetId = document.getElementById('inbound-asset-id').value.trim();
+                return Boolean(currentAssetId) && payload.asset_id === currentAssetId;
+            }
+
+            if (activeInboundContext.requestId && payload.request_id) {
+                return activeInboundContext.requestId === payload.request_id;
+            }
+
+            return activeInboundContext.assetId === payload.asset_id && activeInboundContext.userId === payload.user_id;
+        }
+
+        async function refreshInboundRelatedViews() {
+            if (inboundRefreshPromise) {
+                return inboundRefreshPromise;
+            }
+
+            inboundRefreshPromise = Promise.all([
+                loadAssets(),
+                loadRecords(),
+                loadAssetChanges(),
+                loadDashboard(),
+            ]).finally(() => {
+                inboundRefreshPromise = null;
+            });
+
+            return inboundRefreshPromise;
+        }
+
+        async function handleInboundStatusPayload(payload) {
+            if (payload.code === 'DEVICE_OFFLINE' && activeInboundContext && activeInboundContext.pending) {
+                setStatusText('inbound-status', `入库失败：${payload.message || '设备离线'}`, 'error');
+                setInboundSubmitDisabled(false);
+                activeInboundContext = null;
+                await loadExceptions();
+                return;
+            }
+
+            if (!shouldHandleInboundStatus(payload)) {
+                return;
+            }
+
+            if (activeInboundContext && !activeInboundContext.requestId && payload.request_id) {
+                activeInboundContext.requestId = payload.request_id;
+            }
+
+            if (payload.code === 'WAITING_ACK') {
+                setStatusText('inbound-status', `等待硬件确认：${payload.message}`, 'info');
+                return;
+            }
+
+            if (payload.code === 'WAITING_HW') {
+                setStatusText('inbound-status', `等待硬件确认：${payload.message}`, 'info');
+                return;
+            }
+
+            const tone = resolveStatusTone(payload);
+            const prefix = payload.success ? '入库成功' : '入库失败';
+            setStatusText('inbound-status', `${prefix}：${payload.message || payload.code || '未知结果'}`, tone);
+
+            if (payload.success) {
+                setInboundSubmitDisabled(false);
+                activeInboundContext = null;
+                await refreshInboundRelatedViews();
+                return;
+            }
+
+            if (payload.success === false) {
+                setInboundSubmitDisabled(false);
+                activeInboundContext = null;
+                await loadExceptions();
+            }
+        }
+
+        function buildBorrowRequestsQueryParams() {
+            const applicantUserIdInput = document.getElementById('borrow-request-user-id');
+            const statusInput = document.getElementById('borrow-request-filter-status');
+            const assetIdInput = document.getElementById('borrow-request-asset-id');
+            const params = new URLSearchParams();
+
+            const applicantUserId = applicantUserIdInput ? applicantUserIdInput.value.trim() : '';
+            const status = statusInput ? statusInput.value : '';
+            const assetId = assetIdInput ? assetIdInput.value.trim() : '';
+
+            if (applicantUserId) {
+                params.set('applicant_user_id', applicantUserId);
+            }
+            if (status) {
+                params.set('status', status);
+            }
+            if (assetId) {
+                params.set('asset_id', assetId);
+            }
+            return params;
+        }
+
+        function buildApprovalQueryParams() {
+            const statusInput = document.getElementById('approval-filter-status');
+            const assetIdInput = document.getElementById('approval-filter-asset-id');
+            const params = new URLSearchParams();
+
+            if (statusInput && statusInput.value) {
+                params.set('status', statusInput.value);
+            }
+            if (assetIdInput && assetIdInput.value.trim()) {
+                params.set('asset_id', assetIdInput.value.trim());
+            }
+            return params;
+        }
+
+        function getApprovalReviewerInfo() {
+            const reviewerUserIdInput = document.getElementById('approval-reviewer-user-id');
+            const reviewerUserNameInput = document.getElementById('approval-reviewer-user-name');
+            return {
+                reviewerUserId: reviewerUserIdInput ? reviewerUserIdInput.value.trim() : '',
+                reviewerUserName: reviewerUserNameInput ? reviewerUserNameInput.value.trim() : '',
+            };
+        }
+
+        async function refreshBorrowRequestViews() {
+            await Promise.all([
+                loadBorrowRequests(),
+                loadBorrowApprovals(),
+            ]);
+        }
+
+        async function refreshBorrowSuccessViews() {
+            await Promise.all([
+                loadBorrowRequests(),
+                loadBorrowApprovals(),
+                loadAssets(),
+                loadRecords(),
+                loadAssetChanges(),
+                loadDashboard(),
+            ]);
+        }
+
+        async function submitBorrowRequest() {
+            const assetId = document.getElementById('borrow-request-asset-id').value.trim();
+            const userId = document.getElementById('borrow-request-user-id').value.trim();
+            const userName = document.getElementById('borrow-request-user-name').value.trim();
+            const reason = document.getElementById('borrow-request-reason').value.trim();
+
+            if (!assetId || !userId || !userName) {
+                setStatusText('borrow-status', '借用申请失败：请填写资产ID、借用人ID和借用人姓名。', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/borrow-requests`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        asset_id: assetId,
+                        user_id: userId,
+                        user_name: userName,
+                        reason: reason || null,
+                    })
+                });
+                const result = await response.json();
+                const message = result.message || result.detail || '未知错误';
+                setStatusText('borrow-status', `${result.success ? '借用申请成功' : '借用申请失败'}：${message}`, result.success ? 'success' : 'error');
+                if (result.success) {
+                    await refreshBorrowRequestViews();
+                }
+            } catch (error) {
+                setStatusText('borrow-status', `借用申请失败：${error.message}`, 'error');
+            }
+        }
+
+        async function loadBorrowRequests() {
+            const summary = document.getElementById('borrow-requests-summary');
+            const list = document.getElementById('borrow-requests-list');
+            if (!summary || !list) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/borrow-requests?${buildBorrowRequestsQueryParams().toString()}`);
+                if (!response.ok) {
+                    throw new Error('借用申请列表加载失败');
+                }
+                const payload = await response.json();
+                renderBorrowRequests(payload);
+            } catch (error) {
+                summary.textContent = '';
+                list.innerHTML = `<div class="dashboard-empty">借用申请列表加载失败: ${error.message}</div>`;
+            }
+        }
+
+        function renderBorrowRequests(payload) {
+            const items = payload.items || [];
+            const filters = payload.filters || {};
+            const summary = document.getElementById('borrow-requests-summary');
+            const list = document.getElementById('borrow-requests-list');
+            if (!summary || !list) {
+                return;
+            }
+
+            const statusInput = document.getElementById('borrow-request-filter-status');
+            if (statusInput) {
+                statusInput.value = filters.status || '';
+            }
+            summary.textContent = `共 ${payload.total || 0} 条借用申请`;
+
+            if (!items.length) {
+                list.innerHTML = '<div class="dashboard-empty">暂无匹配借用申请</div>';
+                return;
+            }
+
+            list.innerHTML = items.map(item => `
+                <div class="record-item">
+                    <h3>${item.request_id || '-'}</h3>
+                    <div class="record-grid">
+                        <p><strong>资产ID:</strong> ${item.asset_id || '-'}</p>
+                        <p><strong>申请状态:</strong> ${item.status || '-'}</p>
+                        <p><strong>借用人ID:</strong> ${item.applicant_user_id || '-'}</p>
+                        <p><strong>借用人姓名:</strong> ${item.applicant_user_name || '-'}</p>
+                        <p><strong>申请理由:</strong> ${item.reason || '-'}</p>
+                        <p><strong>申请时间:</strong> ${item.requested_at || '-'}</p>
+                        <p><strong>审批人ID:</strong> ${item.reviewer_user_id || '-'}</p>
+                        <p><strong>审批人姓名:</strong> ${item.reviewer_user_name || '-'}</p>
+                        <p><strong>审批意见:</strong> ${item.review_comment || '-'}</p>
+                        <p><strong>审批时间:</strong> ${item.reviewed_at || '-'}</p>
+                        <p><strong>消耗时间:</strong> ${item.consumed_at || '-'}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function loadBorrowApprovals() {
+            const summary = document.getElementById('approval-summary');
+            const list = document.getElementById('approval-list');
+            if (!summary || !list) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/borrow-requests?${buildApprovalQueryParams().toString()}`);
+                if (!response.ok) {
+                    throw new Error('审批列表加载失败');
+                }
+                const payload = await response.json();
+                renderBorrowApprovals(payload);
+            } catch (error) {
+                summary.textContent = '';
+                list.innerHTML = `<div class="dashboard-empty">审批列表加载失败: ${error.message}</div>`;
+            }
+        }
+
+        function renderBorrowApprovals(payload) {
+            const items = payload.items || [];
+            const filters = payload.filters || {};
+            const summary = document.getElementById('approval-summary');
+            const list = document.getElementById('approval-list');
+            if (!summary || !list) {
+                return;
+            }
+
+            const statusInput = document.getElementById('approval-filter-status');
+            const assetIdInput = document.getElementById('approval-filter-asset-id');
+            if (statusInput) {
+                statusInput.value = filters.status || '';
+            }
+            if (assetIdInput) {
+                assetIdInput.value = filters.asset_id || '';
+            }
+            summary.textContent = `共 ${payload.total || 0} 条审批记录`;
+
+            if (!items.length) {
+                list.innerHTML = '<div class="dashboard-empty">暂无匹配审批记录</div>';
+                return;
+            }
+
+            list.innerHTML = items.map(item => {
+                const actions = [];
+                if (item.status === 'PENDING') {
+                    actions.push(`<button type="button" onclick="approveBorrowRequest('${item.request_id}')">审批通过</button>`);
+                    actions.push(`<button type="button" onclick="rejectBorrowRequest('${item.request_id}')">审批拒绝</button>`);
+                }
+                if (item.status === 'APPROVED') {
+                    actions.push(`<button type="button" onclick="startBorrowFromRequest('${item.request_id}', '${item.asset_id}', '${item.applicant_user_id}', '${item.applicant_user_name}')">发起借出确认</button>`);
+                }
+                return `
+                    <div class="record-item">
+                        <h3>${item.request_id || '-'}</h3>
+                        <div class="record-grid">
+                            <p><strong>资产ID:</strong> ${item.asset_id || '-'}</p>
+                            <p><strong>申请状态:</strong> ${item.status || '-'}</p>
+                            <p><strong>借用人ID:</strong> ${item.applicant_user_id || '-'}</p>
+                            <p><strong>借用人姓名:</strong> ${item.applicant_user_name || '-'}</p>
+                            <p><strong>申请理由:</strong> ${item.reason || '-'}</p>
+                            <p><strong>申请时间:</strong> ${item.requested_at || '-'}</p>
+                            <p><strong>审批人ID:</strong> ${item.reviewer_user_id || '-'}</p>
+                            <p><strong>审批人姓名:</strong> ${item.reviewer_user_name || '-'}</p>
+                            <p><strong>审批意见:</strong> ${item.review_comment || '-'}</p>
+                            <p><strong>审批时间:</strong> ${item.reviewed_at || '-'}</p>
+                            <p><strong>消耗时间:</strong> ${item.consumed_at || '-'}</p>
+                        </div>
+                        ${actions.length ? `<div class="dashboard-actions" style="margin-top: 16px;">${actions.join('')}</div>` : ''}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        async function approveBorrowRequest(requestId) {
+            const { reviewerUserId, reviewerUserName } = getApprovalReviewerInfo();
+            if (!reviewerUserId || !reviewerUserName) {
+                setStatusText('approval-status', '审批失败：请填写管理员ID和管理员姓名。', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/borrow-requests/${encodeURIComponent(requestId)}/approve`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        reviewer_user_id: reviewerUserId,
+                        reviewer_user_name: reviewerUserName,
+                        review_comment: '审批通过',
+                    })
+                });
+                const result = await response.json();
+                const message = result.message || result.detail || '未知错误';
+                setStatusText('approval-status', `${result.success ? '审批成功' : '审批失败'}：${message}`, result.success ? 'success' : 'error');
+                await refreshBorrowRequestViews();
+            } catch (error) {
+                setStatusText('approval-status', `审批失败：${error.message}`, 'error');
+            }
+        }
+
+        async function rejectBorrowRequest(requestId) {
+            const { reviewerUserId, reviewerUserName } = getApprovalReviewerInfo();
+            if (!reviewerUserId || !reviewerUserName) {
+                setStatusText('approval-status', '审批失败：请填写管理员ID和管理员姓名。', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/borrow-requests/${encodeURIComponent(requestId)}/reject`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        reviewer_user_id: reviewerUserId,
+                        reviewer_user_name: reviewerUserName,
+                        review_comment: '审批拒绝',
+                    })
+                });
+                const result = await response.json();
+                const message = result.message || result.detail || '未知错误';
+                setStatusText('approval-status', `${result.success ? '审批成功' : '审批失败'}：${message}`, result.success ? 'success' : 'error');
+                await refreshBorrowRequestViews();
+            } catch (error) {
+                setStatusText('approval-status', `审批失败：${error.message}`, 'error');
+            }
+        }
+
+        function shouldHandleBorrowStartStatus(payload) {
+            if (!activeBorrowApprovalContext || payload.action_type !== 'BORROW') {
+                return false;
+            }
+
+            if (activeBorrowApprovalContext.requestId && payload.request_id) {
+                return activeBorrowApprovalContext.requestId === payload.request_id;
+            }
+
+            return payload.asset_id === activeBorrowApprovalContext.assetId
+                && payload.user_id === activeBorrowApprovalContext.userId;
+        }
+
+        async function handleBorrowStartStatusPayload(payload) {
+            if (payload.code === 'DEVICE_OFFLINE' && activeBorrowApprovalContext && activeBorrowApprovalContext.pending) {
+                setStatusText('approval-status', `借出失败：${payload.message || '设备离线'}`, 'error');
+                activeBorrowApprovalContext = null;
+                await loadExceptions();
+                return;
+            }
+
+            if (!shouldHandleBorrowStartStatus(payload)) {
+                return;
+            }
+
+            if (activeBorrowApprovalContext && !activeBorrowApprovalContext.requestId && payload.request_id) {
+                activeBorrowApprovalContext.requestId = payload.request_id;
+            }
+
+            if (payload.code === 'WAITING_ACK' || payload.code === 'WAITING_HW') {
+                setStatusText('approval-status', `等待硬件确认：${payload.message || payload.code}`, 'info');
+                return;
+            }
+
+            const tone = resolveStatusTone(payload);
+            const prefix = payload.success ? '借出成功' : '借出失败';
+            setStatusText('approval-status', `${prefix}：${payload.message || payload.code || '未知结果'}`, tone);
+
+            if (payload.success) {
+                activeBorrowApprovalContext = null;
+                await refreshBorrowSuccessViews();
+                return;
+            }
+
+            if (payload.success === false) {
+                activeBorrowApprovalContext = null;
+                await Promise.all([
+                    loadBorrowRequests(),
+                    loadBorrowApprovals(),
+                    loadExceptions(),
+                ]);
+            }
+        }
+
+        async function startBorrowFromRequest(requestId, assetId, userId, userName) {
+            activeBorrowApprovalContext = {
+                requestId: null,
+                borrowRequestId: requestId,
+                assetId,
+                userId,
+                userName,
+                pending: true,
+            };
+            setStatusText('approval-status', '等待硬件确认：已从审批通过申请发起借出确认。', 'info');
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/borrow-requests/${encodeURIComponent(requestId)}/start-borrow`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ timeout_ms: 30000 })
+                });
+                const result = await response.json();
+                const message = result.message || result.detail || '未知错误';
+
+                if (activeBorrowApprovalContext && result.request_id) {
+                    activeBorrowApprovalContext.requestId = result.request_id;
+                }
+
+                if (result.success) {
+                    setStatusText('approval-status', `借出成功：${message}`, 'success');
+                    activeBorrowApprovalContext = null;
+                    await refreshBorrowSuccessViews();
+                } else {
+                    setStatusText('approval-status', `借出失败：${message}`, 'error');
+                    activeBorrowApprovalContext = null;
+                    await Promise.all([
+                        loadBorrowRequests(),
+                        loadBorrowApprovals(),
+                        loadExceptions(),
+                    ]);
+                }
+            } catch (error) {
+                setStatusText('approval-status', `借出失败：${error.message}`, 'error');
+                activeBorrowApprovalContext = null;
+            }
+        }
+
+        function initWebSocket() {
+            const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${wsProtocol}://${location.host}/ws/status`);
+
+            ws.onopen = () => {
+                console.log('WebSocket连接已建立');
+            };
+
+            ws.onmessage = async (event) => {
+                const payload = JSON.parse(event.data);
+                addStatusMessage(payload);
+                await handleInboundStatusPayload(payload);
+                await handleBorrowStartStatusPayload(payload);
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket连接已关闭');
+                setTimeout(initWebSocket, 5000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket错误:', error);
+            };
+        }
+
+        // 借出资产
+        async function borrowAsset() {
+            const assetId = document.getElementById('borrow-asset-id').value;
+            const userId = document.getElementById('borrow-user-id').value;
+            const userName = document.getElementById('borrow-user-name').value;
+
+            if (!assetId || !userId || !userName) {
+                document.getElementById('borrow-status').innerHTML = '请填写所有必填字段';
+                document.getElementById('borrow-status').className = 'status error';
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/transactions/borrow`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        asset_id: assetId,
+                        user_id: userId,
+                        user_name: userName
+                    })
+                });
+
+                const result = await response.json();
+                const borrowMessage = result.message || result.detail || '未知错误';
+
+                if (result.success) {
+                    document.getElementById('borrow-status').innerHTML = `借出成功: ${result.message}`;
+                    document.getElementById('borrow-status').className = 'status success';
+                    await loadAssets();
+                } else {
+                    document.getElementById('borrow-status').innerHTML = `借出失败: ${borrowMessage}`;
+                    document.getElementById('borrow-status').className = 'status error';
+                }
+            } catch (error) {
+                document.getElementById('borrow-status').innerHTML = `请求错误: ${error.message}`;
+                document.getElementById('borrow-status').className = 'status error';
+            }
+        }
+
+        // 归还资产
+        async function returnAsset() {
+            const assetId = document.getElementById('return-asset-id').value;
+            const userId = document.getElementById('return-user-id').value;
+            const userName = document.getElementById('return-user-name').value;
+
+            if (!assetId || !userId || !userName) {
+                document.getElementById('return-status').innerHTML = '请填写所有必填字段';
+                document.getElementById('return-status').className = 'status error';
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/transactions/return`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        asset_id: assetId,
+                        user_id: userId,
+                        user_name: userName
+                    })
+                });
+
+                const result = await response.json();
+                const returnMessage = result.message || result.detail || '未知错误';
+
+                if (result.success) {
+                    document.getElementById('return-status').innerHTML = `归还成功: ${result.message}`;
+                    document.getElementById('return-status').className = 'status success';
+                    await loadAssets();
+                } else {
+                    document.getElementById('return-status').innerHTML = `归还失败: ${returnMessage}`;
+                    document.getElementById('return-status').className = 'status error';
+                }
+            } catch (error) {
+                document.getElementById('return-status').innerHTML = `请求错误: ${error.message}`;
+                document.getElementById('return-status').className = 'status error';
+            }
+        }
+
+        async function submitInbound() {
+            const requestBody = getInboundRequestBody();
+            const categoryId = requestBody.category_id;
+
+            if (!requestBody.asset_id || !requestBody.user_id || !requestBody.user_name || !requestBody.asset_name || !requestBody.location) {
+                setStatusText('inbound-status', '入库失败：请填写资产ID、资产名称、存放位置、管理员ID和管理员姓名。', 'error');
+                return;
+            }
+
+            if (categoryId !== null && (!Number.isInteger(categoryId) || categoryId <= 0)) {
+                setStatusText('inbound-status', '入库失败：分类ID必须为正整数。', 'error');
+                return;
+            }
+
+            activeInboundContext = {
+                assetId: requestBody.asset_id,
+                userId: requestBody.user_id,
+                userName: requestBody.user_name,
+                requestId: null,
+                pending: true,
+            };
+            setInboundSubmitDisabled(true);
+            setStatusText('inbound-status', '等待硬件确认：入库请求已发送，等待后端与硬件确认结果。', 'info');
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/transactions/inbound`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+
+                const result = await response.json();
+                const inboundMessage = result.message || result.detail || '未知错误';
+
+                if (activeInboundContext && result.request_id) {
+                    activeInboundContext.requestId = result.request_id;
+                }
+
+                if (result.success) {
+                    setStatusText('inbound-status', `入库成功：${inboundMessage}`, 'success');
+                    setInboundSubmitDisabled(false);
+                    activeInboundContext = null;
+                    await refreshInboundRelatedViews();
+                } else {
+                    setStatusText('inbound-status', `入库失败：${inboundMessage}`, 'error');
+                    setInboundSubmitDisabled(false);
+                    activeInboundContext = null;
+                    await loadExceptions();
+                }
+            } catch (error) {
+                setStatusText('inbound-status', `请求错误：${error.message}`, 'error');
+                setInboundSubmitDisabled(false);
+                activeInboundContext = null;
+            }
+        }
+
+        async function loadAssets() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/assets`);
+                const assets = await response.json();
+                const assetStatusClassMap = {
+                    '在库': 'status-in-stock',
+                    '借出': 'status-borrowed',
+                    '维修': 'status-maintenance',
+                    '报废': 'status-scrapped',
+                };
+
+                const assetList = document.getElementById('asset-list');
+                assetList.innerHTML = '';
+
+                for (const assetId in assets) {
+                    const assetStatus = assets[assetId];
+                    const assetStatusClass = assetStatusClassMap[assetStatus] || '';
+                    const assetItem = document.createElement('div');
+                    assetItem.className = 'asset-item';
+                    assetItem.innerHTML = `
+                        <h3>${assetId}</h3>
+                        <p>状态: <span class="asset-status ${assetStatusClass}">${assetStatus}</span></p>
+                    `;
+                    assetList.appendChild(assetItem);
+                }
+            } catch (error) {
+                console.error('加载资产列表失败:', error);
+            }
+        }
+
+        function triggerDownload(url) {
+            const link = document.createElement('a');
+            link.href = url;
+            link.style.display = 'none';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        function downloadAssetsExport() {
+            triggerDownload(`${API_BASE_URL}/export/assets.csv`);
+        }
+
+        function downloadOperationsExport() {
+            triggerDownload(`${API_BASE_URL}/export/operations.csv`);
+        }
+
+        function downloadDashboardExport() {
+            const timeRangeSelect = document.getElementById('dashboard-time-range');
+            const timeRange = timeRangeSelect ? timeRangeSelect.value : 'all';
+            triggerDownload(`${API_BASE_URL}/export/dashboard.json?time_range=${encodeURIComponent(timeRange)}`);
+        }
+
+        function buildRecordsQueryParams() {
+            const assetId = document.getElementById('records-asset-id').value.trim();
+            const actionType = document.getElementById('records-action-type').value;
+            const timeRange = document.getElementById('records-time-range').value || 'all';
+            const params = new URLSearchParams();
+
+            if (assetId) {
+                params.set('asset_id', assetId);
+            }
+            if (actionType) {
+                params.set('action_type', actionType);
+            }
+            params.set('time_range', timeRange);
+            return params;
+        }
+
+        function downloadFilteredRecordsExport() {
+            triggerDownload(`${API_BASE_URL}/export/records.csv?${buildRecordsQueryParams().toString()}`);
+        }
+
+        // 加载操作记录
+        async function loadRecords() {
+            const recordsStatus = document.getElementById('records-status');
+            const params = buildRecordsQueryParams();
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/records?${params.toString()}`);
+                if (!response.ok) {
+                    throw new Error('操作记录加载失败');
+                }
+
+                const payload = await response.json();
+                renderRecords(payload);
+                recordsStatus.innerHTML = '';
+                recordsStatus.className = '';
+            } catch (error) {
+                recordsStatus.innerHTML = `操作记录加载失败: ${error.message}`;
+                recordsStatus.className = 'status error';
+            }
+        }
+
+        function renderRecords(payload) {
+            const filters = payload.filters || {};
+            const items = payload.items || [];
+            const total = payload.total || 0;
+
+            document.getElementById('records-asset-id').value = filters.asset_id || '';
+            document.getElementById('records-action-type').value = filters.action_type || '';
+            document.getElementById('records-time-range').value = filters.time_range || 'all';
+            document.getElementById('records-summary').textContent = `共 ${total} 条记录`;
+
+            const recordsList = document.getElementById('records-list');
+            if (!items.length) {
+                recordsList.innerHTML = '<div class="dashboard-empty">暂无匹配记录</div>';
+                return;
+            }
+
+            recordsList.innerHTML = items.map(item => `
+                <div class="record-item">
+                    <h3>${item.asset_id || '-'}</h3>
+                    <div class="record-grid">
+                        <p><strong>动作类型:</strong> ${item.action_type || '-'}</p>
+                        <p><strong>用户ID:</strong> ${item.user_id || '-'}</p>
+                        <p><strong>用户姓名:</strong> ${item.user_name || '-'}</p>
+                        <p><strong>操作时间:</strong> ${item.op_time || '-'}</p>
+                        <p><strong>硬件确认序号:</strong> ${item.hw_seq || '-'}</p>
+                        <p><strong>硬件确认结果:</strong> ${item.hw_result || '-'}</p>
+                        <p><strong>硬件设备标识:</strong> ${item.hw_sn || '-'}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function buildAssetChangesQueryParams() {
+            const assetId = document.getElementById('asset-changes-asset-id').value.trim();
+            const actionType = document.getElementById('asset-changes-action-type').value;
+            const timeRange = document.getElementById('asset-changes-time-range').value || 'all';
+            const params = new URLSearchParams();
+
+            if (assetId) {
+                params.set('asset_id', assetId);
+            }
+            if (actionType) {
+                params.set('action_type', actionType);
+            }
+            params.set('time_range', timeRange);
+            return params;
+        }
+
+        async function loadAssetChanges() {
+            const assetChangesStatus = document.getElementById('asset-changes-status');
+            const params = buildAssetChangesQueryParams();
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/asset-changes?${params.toString()}`);
+                if (!response.ok) {
+                    throw new Error('资产变更加载失败');
+                }
+
+                const payload = await response.json();
+                renderAssetChanges(payload);
+                assetChangesStatus.innerHTML = '';
+                assetChangesStatus.className = '';
+            } catch (error) {
+                assetChangesStatus.innerHTML = `资产变更加载失败: ${error.message}`;
+                assetChangesStatus.className = 'status error';
+            }
+        }
+
+        function renderAssetChanges(payload) {
+            const filters = payload.filters || {};
+            const items = payload.items || [];
+            const total = payload.total || 0;
+
+            document.getElementById('asset-changes-asset-id').value = filters.asset_id || '';
+            document.getElementById('asset-changes-action-type').value = filters.action_type || '';
+            document.getElementById('asset-changes-time-range').value = filters.time_range || 'all';
+            document.getElementById('asset-changes-summary').textContent = `共 ${total} 条变更记录`;
+
+            const assetChangesList = document.getElementById('asset-changes-list');
+            if (!items.length) {
+                assetChangesList.innerHTML = '<div class="dashboard-empty">暂无匹配变更记录</div>';
+                return;
+            }
+
+            assetChangesList.innerHTML = items.map(item => `
+                <div class="record-item">
+                    <h3>${item.asset_id || '-'}</h3>
+                    <div class="record-grid">
+                        <p><strong>动作类型:</strong> ${item.action_type || '-'}</p>
+                        <p><strong>变更前状态:</strong> ${item.from_status || '-'}</p>
+                        <p><strong>变更后状态:</strong> ${item.to_status || '-'}</p>
+                        <p><strong>用户ID:</strong> ${item.user_id || '-'}</p>
+                        <p><strong>用户姓名:</strong> ${item.user_name || '-'}</p>
+                        <p><strong>操作时间:</strong> ${item.op_time || '-'}</p>
+                        <p><strong>硬件确认序号:</strong> ${item.hw_seq || '-'}</p>
+                        <p><strong>硬件确认结果:</strong> ${item.hw_result || '-'}</p>
+                        <p><strong>硬件设备标识:</strong> ${item.hw_sn || '-'}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function buildExceptionsQueryParams() {
+            const assetId = document.getElementById('exceptions-asset-id').value.trim();
+            const actionType = document.getElementById('exceptions-action-type').value;
+            const code = document.getElementById('exceptions-code').value;
+            const timeRange = document.getElementById('exceptions-time-range').value || 'all';
+            const params = new URLSearchParams();
+
+            if (assetId) {
+                params.set('asset_id', assetId);
+            }
+            if (actionType) {
+                params.set('action_type', actionType);
+            }
+            if (code) {
+                params.set('code', code);
+            }
+            params.set('time_range', timeRange);
+            return params;
+        }
+
+        function downloadFilteredExceptionsExport() {
+            triggerDownload(`${API_BASE_URL}/export/exceptions.csv?${buildExceptionsQueryParams().toString()}`);
+        }
+
+        async function loadExceptions() {
+            const exceptionsStatus = document.getElementById('exceptions-status');
+            const params = buildExceptionsQueryParams();
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/exceptions?${params.toString()}`);
+                if (!response.ok) {
+                    throw new Error('异常记录加载失败');
+                }
+
+                const payload = await response.json();
+                renderExceptions(payload);
+                exceptionsStatus.innerHTML = '';
+                exceptionsStatus.className = '';
+            } catch (error) {
+                exceptionsStatus.innerHTML = `异常记录加载失败: ${error.message}`;
+                exceptionsStatus.className = 'status error';
+            }
+        }
+
+        function renderExceptions(payload) {
+            const filters = payload.filters || {};
+            const items = payload.items || [];
+            const total = payload.total || 0;
+
+            document.getElementById('exceptions-asset-id').value = filters.asset_id || '';
+            document.getElementById('exceptions-action-type').value = filters.action_type || '';
+            document.getElementById('exceptions-code').value = filters.code || '';
+            document.getElementById('exceptions-time-range').value = filters.time_range || 'all';
+            document.getElementById('exceptions-summary').textContent = `共 ${total} 条异常记录`;
+
+            const exceptionsList = document.getElementById('exceptions-list');
+            if (!items.length) {
+                exceptionsList.innerHTML = '<div class="dashboard-empty">暂无匹配异常记录</div>';
+                return;
+            }
+
+            exceptionsList.innerHTML = items.map(item => `
+                <div class="record-item">
+                    <h3>${item.asset_id || '-'}</h3>
+                    <div class="record-grid">
+                        <p><strong>动作类型:</strong> ${item.action_type || '-'}</p>
+                        <p><strong>用户ID:</strong> ${item.user_id || '-'}</p>
+                        <p><strong>用户姓名:</strong> ${item.user_name || '-'}</p>
+                        <p><strong>异常码:</strong> ${item.code || '-'}</p>
+                        <p><strong>异常消息:</strong> ${item.message || '-'}</p>
+                        <p><strong>事件时间:</strong> ${item.event_time || '-'}</p>
+                        <p><strong>请求序号:</strong> ${item.request_seq || '-'}</p>
+                        <p><strong>硬件确认序号:</strong> ${item.hw_seq || '-'}</p>
+                        <p><strong>硬件确认结果:</strong> ${item.hw_result || '-'}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // 加载看板统计
+        async function loadDashboard() {
+            const dashboardStatus = document.getElementById('dashboard-status');
+            const timeRangeSelect = document.getElementById('dashboard-time-range');
+            const timeRange = timeRangeSelect ? timeRangeSelect.value : 'all';
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/dashboard?time_range=${encodeURIComponent(timeRange)}`);
+                if (!response.ok) {
+                    throw new Error('看板数据加载失败');
+                }
+
+                const dashboard = await response.json();
+                renderDashboard(dashboard);
+                dashboardStatus.innerHTML = '';
+                dashboardStatus.className = '';
+            } catch (error) {
+                dashboardStatus.innerHTML = `看板加载失败: ${error.message}`;
+                dashboardStatus.className = 'status error';
+            }
+        }
+
+        function renderDashboard(dashboard) {
+            const filters = dashboard.filters || {};
+            const summary = dashboard.summary || {};
+            const operationStats = dashboard.operation_stats || {};
+            const borrowTopAssets = dashboard.borrow_top_assets || [];
+            const timeRangeSelect = document.getElementById('dashboard-time-range');
+
+            if (timeRangeSelect && filters.time_range) {
+                timeRangeSelect.value = filters.time_range;
+            }
+
+            document.getElementById('dashboard-summary').innerHTML = `
+                <div class="dashboard-card">
+                    <h3>在库资产</h3>
+                    <div class="dashboard-value">${summary.in_stock || 0}</div>
+                </div>
+                <div class="dashboard-card">
+                    <h3>借出资产</h3>
+                    <div class="dashboard-value">${summary.borrowed || 0}</div>
+                </div>
+                <div class="dashboard-card">
+                    <h3>维修资产</h3>
+                    <div class="dashboard-value">${summary.maintenance || 0}</div>
+                </div>
+                <div class="dashboard-card">
+                    <h3>报废资产</h3>
+                    <div class="dashboard-value">${summary.scrapped || 0}</div>
+                </div>
+            `;
+
+            document.getElementById('dashboard-operation-stats').innerHTML = `
+                <div class="dashboard-card">
+                    <h3>Borrow 次数</h3>
+                    <div class="dashboard-value">${operationStats.borrow_count || 0}</div>
+                </div>
+                <div class="dashboard-card">
+                    <h3>Return 次数</h3>
+                    <div class="dashboard-value">${operationStats.return_count || 0}</div>
+                </div>
+            `;
+
+            const borrowTopContainer = document.getElementById('dashboard-borrow-top');
+            if (!borrowTopAssets.length) {
+                borrowTopContainer.innerHTML = '<div class="dashboard-empty">暂无借用记录</div>';
+                return;
+            }
+
+            borrowTopContainer.innerHTML = borrowTopAssets.map((item, index) => `
+                <div class="dashboard-list-item">
+                    <span>TOP ${index + 1} - ${item.asset_id}</span>
+                    <span>${item.count}</span>
+                </div>
+            `).join('');
+        }
+
+        async function submitScanResult() {
+            const scanResult = document.getElementById('scan-result').value.trim();
+
+            if (!scanResult) {
+                setStatusText('scan-status', '请填写扫描结果。', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/scan/result`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        asset_id: scanResult
+                    })
+                });
+
+                const result = await response.json();
+                const scanMessage = result.message || result.detail || '未知错误';
+
+                if (result.success === true) {
+                    setStatusText('scan-status', `扫描成功：${scanMessage}，已带入入库页。`, 'success');
+                    bindScanResultToInbound(result, scanResult);
+                } else if (result.code === 'ASSET_NOT_FOUND' && result.asset_id) {
+                    setStatusText('scan-status', `扫描结果已接收：${scanMessage}，已带入入库页，可继续发起入库。`, 'info');
+                    bindScanResultToInbound(result, scanResult);
+                } else {
+                    setStatusText('scan-status', `扫描失败：${scanMessage}`, 'error');
+                }
+            } catch (error) {
+                setStatusText('scan-status', `请求错误：${error.message}`, 'error');
+            }
+        }
+    </script>
+</body>
+
+</html>

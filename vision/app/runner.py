@@ -109,6 +109,10 @@ class _RunCounters:
     conflict_count: int = 0
     submit_success_count: int = 0
     submit_fail_count: int = 0
+    transport_fail_count: int = 0
+    http_fail_count: int = 0
+    protocol_fail_count: int = 0
+    business_fail_count: int = 0
     reconnect_attempt_count: int = 0
     reconnect_success_count: int = 0
     reconnect_fail_count: int = 0
@@ -283,7 +287,8 @@ class VisionRunner:
         LOGGER.info(
             "vision runner finished status=%s processed_frames=%s submitted_frames=%s skipped_frames=%s failed_frames=%s "
             "low_quality_count=%s no_code_count=%s parse_fail_count=%s duplicate_count=%s conflict_count=%s "
-            "submit_success_count=%s submit_fail_count=%s reconnect_attempt_count=%s reconnect_success_count=%s "
+            "submit_success_count=%s submit_fail_count=%s transport_fail_count=%s http_fail_count=%s "
+            "protocol_fail_count=%s business_fail_count=%s reconnect_attempt_count=%s reconnect_success_count=%s "
             "reconnect_fail_count=%s health_state=%s uptime_sec=%.3f ended_by=%s",
             result.status,
             result.processed_frames,
@@ -297,6 +302,10 @@ class VisionRunner:
             result.conflict_count,
             result.submit_success_count,
             result.submit_fail_count,
+            result.transport_fail_count,
+            result.http_fail_count,
+            result.protocol_fail_count,
+            result.business_fail_count,
             result.reconnect_attempt_count,
             result.reconnect_success_count,
             result.reconnect_fail_count,
@@ -594,24 +603,26 @@ class VisionRunner:
             return
 
         self._counters.failed_frames += 1
-        if error.error_code == "LOW_QUALITY":
+        classifier = self._extract_failure_classifier(error)
+        if classifier == "low_quality" or error.error_code == "LOW_QUALITY":
             self._counters.low_quality_count += 1
             self._record_event("preprocess_failed", message=error.message, frame_id=error.frame_id, source_id=error.source_id, code=error.error_code)
             return
-        if error.error_code == "NO_CODE":
+        if classifier == "no_code" or error.error_code == "NO_CODE":
             self._counters.no_code_count += 1
             self._record_event("decode_no_result", message=error.message, frame_id=error.frame_id, source_id=error.source_id, code=error.error_code)
             return
-        if error.error_code == "MULTI_RESULT_CONFLICT":
+        if classifier == "conflict" or error.error_code == "MULTI_RESULT_CONFLICT":
             self._counters.conflict_count += 1
             self._record_event("dedup_conflict", message=error.message, frame_id=error.frame_id, source_id=error.source_id, code=error.error_code)
             return
-        if error.stage == "parser":
+        if classifier == "parse_fail" or error.stage == "parser":
             self._counters.parse_fail_count += 1
             self._record_event("parse_failed", message=error.message, frame_id=error.frame_id, source_id=error.source_id, code=error.error_code)
             return
-        if error.stage == "gateway":
+        if classifier == "submit_fail" or error.stage == "gateway":
             self._counters.submit_fail_count += 1
+            self._record_submit_failure_breakdown(output)
             self._record_event(
                 "submit_failed",
                 message=error.message,
@@ -622,6 +633,7 @@ class VisionRunner:
                 extra={
                     "raw_text": output.submit_request.raw_text if output.submit_request is not None else None,
                     "symbology": output.submit_request.symbology if output.submit_request is not None else None,
+                    "submit_failure_kind": self._extract_submit_failure_kind(output),
                 },
             )
             return
@@ -638,6 +650,39 @@ class VisionRunner:
             )
             return
         self._record_event("pipeline_failed", message=error.message, frame_id=error.frame_id, source_id=error.source_id, code=error.error_code)
+
+    def _extract_failure_classifier(self, error: VisionErrorResult) -> str | None:
+        classifier = error.extra.get("classifier")
+        return str(classifier) if isinstance(classifier, str) and classifier.strip() else None
+
+    def _extract_submit_failure_kind(self, output: PipelineRunOutput) -> str:
+        if output.error is not None:
+            kind = output.error.extra.get("submit_failure_kind")
+            if isinstance(kind, str) and kind.strip():
+                return kind
+        if output.submit_result is None:
+            return "unknown"
+        if not output.submit_result.transport_success:
+            return "transport"
+        if not output.submit_result.http_ok:
+            return "http"
+        if not output.submit_result.response_valid:
+            return "protocol"
+        return "business"
+
+    def _record_submit_failure_breakdown(self, output: PipelineRunOutput) -> None:
+        failure_kind = self._extract_submit_failure_kind(output)
+        if failure_kind == "transport":
+            self._counters.transport_fail_count += 1
+            return
+        if failure_kind == "http":
+            self._counters.http_fail_count += 1
+            return
+        if failure_kind == "protocol":
+            self._counters.protocol_fail_count += 1
+            return
+        if failure_kind == "business":
+            self._counters.business_fail_count += 1
 
     def _record_event(
         self,
@@ -795,11 +840,11 @@ class VisionRunner:
     def _should_end_for_soak_before_iteration(self) -> str | None:
         if not self.config.runtime.soak_enabled:
             return None
-        duration_limit = self.config.runtime.soak_duration_sec
+        duration_limit = self.config.runtime.max_duration_sec
         if duration_limit is not None and self._current_uptime_sec() >= float(duration_limit):
             self._record_event(
                 "soak_limit_reached",
-                message=f"soak duration reached {duration_limit}s",
+                message=f"runtime max_duration_sec reached {duration_limit}s",
                 source_id=self.config.capture.source_id,
                 code="SOAK_DURATION_REACHED",
                 extra={"uptime_sec": self._current_uptime_sec()},
@@ -810,11 +855,11 @@ class VisionRunner:
     def _should_end_for_soak_after_output(self) -> str | None:
         if not self.config.runtime.soak_enabled:
             return None
-        max_frames = self.config.runtime.soak_max_frames
+        max_frames = self.config.runtime.max_frames
         if max_frames is not None and self._counters.processed_frames >= max_frames:
             self._record_event(
                 "soak_limit_reached",
-                message=f"soak max_frames reached {max_frames}",
+                message=f"runtime max_frames reached {max_frames}",
                 source_id=self.config.capture.source_id,
                 code="SOAK_MAX_FRAMES_REACHED",
                 extra={"processed_frames": self._counters.processed_frames},
@@ -843,6 +888,9 @@ class VisionRunner:
             "ended_at_epoch_sec": self._run_finished_at,
             "uptime_sec": self._current_uptime_sec(),
             "soak_enabled": self.config.runtime.soak_enabled,
+            "max_duration_sec": self.config.runtime.max_duration_sec,
+            "max_frames": self.config.runtime.max_frames,
+            "summary_on_exit": self.config.runtime.summary_on_exit,
             "preview_requested": self.config.runtime.show_preview,
             "preview_active": self.preview_renderer is not None,
             "preview_overlay_enabled": self.config.runtime.preview_overlay_enabled,
@@ -886,6 +934,10 @@ class VisionRunner:
             conflict_count=self._counters.conflict_count,
             submit_success_count=self._counters.submit_success_count,
             submit_fail_count=self._counters.submit_fail_count,
+            transport_fail_count=self._counters.transport_fail_count,
+            http_fail_count=self._counters.http_fail_count,
+            protocol_fail_count=self._counters.protocol_fail_count,
+            business_fail_count=self._counters.business_fail_count,
             reconnect_attempt_count=self._counters.reconnect_attempt_count,
             reconnect_success_count=self._counters.reconnect_success_count,
             reconnect_fail_count=self._counters.reconnect_fail_count,
@@ -946,9 +998,9 @@ def _build_api_client(config: VisionConfig) -> APIClient:
         return APIClient(
             config.gateway,
             transport=build_contract_mock_transport(),
-            strict_response_validation=True,
+            strict_response_validation=config.gateway.strict_response_validation,
         )
-    return APIClient(config.gateway, strict_response_validation=True)
+    return APIClient(config.gateway, strict_response_validation=config.gateway.strict_response_validation)
 
 
 def _build_source(config: VisionConfig) -> FrameSource:

@@ -13,6 +13,9 @@ def validate_asset_transition(current_status: AssetStatus, action_type: ActionTy
             return "资产当前处于维修状态，禁止发起借出"
         return "资产当前处于报废状态，禁止发起借出"
 
+    if action_type == ActionType.INBOUND:
+        return "资产入库必须通过独立入库提交流程处理"
+
     if current_status == AssetStatus.BORROWED:
         return None
     if current_status == AssetStatus.IN_STOCK:
@@ -25,4 +28,6 @@ def validate_asset_transition(current_status: AssetStatus, action_type: ActionTy
 def next_asset_status_for_action(action_type: ActionType) -> AssetStatus:
     if action_type == ActionType.BORROW:
         return AssetStatus.BORROWED
-    return AssetStatus.IN_STOCK
+    if action_type == ActionType.RETURN:
+        return AssetStatus.IN_STOCK
+    raise ValueError(f"unsupported asset transition action: {action_type.value}")
