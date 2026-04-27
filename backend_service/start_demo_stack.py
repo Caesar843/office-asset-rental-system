@@ -129,6 +129,19 @@ def print_summary(args: argparse.Namespace, *, serial_port: str, transport_mode:
             "url": f"{base_url}/transactions/return",
             "json": {"asset_id": "AS-0925", "user_id": "U-1002", "user_name": "Demo Return", "timeout_ms": 3000},
         },
+        "inbound_example": {
+            "method": "POST",
+            "url": f"{base_url}/transactions/inbound",
+            "json": {
+                "asset_id": "AS-0926",
+                "user_id": "U-ADMIN",
+                "user_name": "Demo Admin",
+                "asset_name": "Demo Inbound Asset",
+                "category_id": 1,
+                "location": "Inbound Shelf",
+                "timeout_ms": 3000,
+            },
+        },
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

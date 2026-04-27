@@ -663,6 +663,7 @@
                         <label for="exceptions-code">异常码</label>
                         <select id="exceptions-code">
                             <option value="">全部</option>
+                            <option value="OVERDUE">OVERDUE</option>
                             <option value="DEVICE_OFFLINE">DEVICE_OFFLINE</option>
                             <option value="ASSET_NOT_FOUND">ASSET_NOT_FOUND</option>
                             <option value="STATE_INVALID">STATE_INVALID</option>
@@ -752,6 +753,14 @@
             'ACK_ERROR',
             'ACK_INVALID',
         ]);
+        const RETURN_ACCEPTANCE_FIELD_LABELS = {
+            asset_id: '资产ID',
+            accepted_by_user_id: '验收人ID',
+            accepted_by_user_name: '验收人姓名',
+            acceptance_result: '验收结果',
+            note: '备注',
+            requested_days: '借用天数',
+        };
 
         function setupBorrowRequestPages() {
             const tabsContainer = document.querySelector('.tabs');
@@ -791,6 +800,10 @@
                     <div class="form-group">
                         <label for="borrow-request-reason">申请理由</label>
                         <input type="text" id="borrow-request-reason" placeholder="例如: 外出答辩临时借用">
+                    </div>
+                    <div class="form-group">
+                        <label for="borrow-request-days">借用天数</label>
+                        <input type="number" id="borrow-request-days" min="1" max="30" placeholder="默认 30 天，最大 30 天">
                     </div>
                     <button onclick="submitBorrowRequest()">提交借用申请</button>
                     <div id="borrow-status" class="status info">填写资产和借用人信息后提交申请，等待管理员审批。</div>
@@ -858,8 +871,102 @@
             }
         }
 
+        function setupReturnAcceptancePage() {
+            const tabsContainer = document.querySelector('.tabs');
+            if (tabsContainer && !tabsContainer.querySelector('[data-tab="return-acceptances"]')) {
+                const acceptanceTabButton = document.createElement('div');
+                acceptanceTabButton.className = 'tab';
+                acceptanceTabButton.setAttribute('data-tab', 'return-acceptances');
+                acceptanceTabButton.textContent = '验收记录';
+
+                const assetChangesTabButton = tabsContainer.querySelector('[data-tab="asset-changes"]');
+                if (assetChangesTabButton) {
+                    tabsContainer.insertBefore(acceptanceTabButton, assetChangesTabButton);
+                } else {
+                    tabsContainer.appendChild(acceptanceTabButton);
+                }
+            }
+
+            if (!document.getElementById('return-acceptances')) {
+                const acceptancePanel = document.createElement('div');
+                acceptancePanel.id = 'return-acceptances';
+                acceptancePanel.className = 'tab-content';
+                acceptancePanel.innerHTML = `
+                    <div class="form-group">
+                        <label for="return-acceptance-asset-id">资产ID</label>
+                        <input type="text" id="return-acceptance-asset-id" placeholder="例如: AS-0924">
+                    </div>
+                    <div class="form-group">
+                        <label for="return-acceptance-result">验收结果</label>
+                        <select id="return-acceptance-result">
+                            <option value="NORMAL">NORMAL</option>
+                            <option value="DAMAGED">DAMAGED</option>
+                            <option value="MISSING_PARTS">MISSING_PARTS</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="return-acceptance-note">备注</label>
+                        <input type="text" id="return-acceptance-note" placeholder="可选：记录损坏或缺件说明">
+                    </div>
+                    <div class="form-group">
+                        <label for="return-acceptance-user-id">验收人ID</label>
+                        <input type="text" id="return-acceptance-user-id" value="${APPROVAL_DEMO_USER_ID}" placeholder="例如: U-ADMIN">
+                    </div>
+                    <div class="form-group">
+                        <label for="return-acceptance-user-name">验收人姓名</label>
+                        <input type="text" id="return-acceptance-user-name" value="${APPROVAL_DEMO_USER_NAME}" placeholder="例如: Admin">
+                    </div>
+                    <button type="button" onclick="submitReturnAcceptance()">提交验收记录</button>
+                    <div id="return-acceptance-status" class="status info">仅对已成功归还的资产创建验收记录。DAMAGED / MISSING_PARTS 当前只做记录，不会自动创建维修流程，也不会自动改资产状态。</div>
+                    <div class="records-toolbar" style="margin-top: 20px;">
+                        <div class="form-group">
+                            <label for="return-acceptance-filter-asset-id">资产ID</label>
+                            <input type="text" id="return-acceptance-filter-asset-id" placeholder="例如: AS-0924">
+                        </div>
+                        <div class="form-group">
+                            <label for="return-acceptance-filter-result">验收结果</label>
+                            <select id="return-acceptance-filter-result">
+                                <option value="">全部</option>
+                                <option value="NORMAL">NORMAL</option>
+                                <option value="DAMAGED">DAMAGED</option>
+                                <option value="MISSING_PARTS">MISSING_PARTS</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="return-acceptance-filter-user-id">验收人ID</label>
+                            <input type="text" id="return-acceptance-filter-user-id" placeholder="例如: U-ADMIN">
+                        </div>
+                        <div class="form-group">
+                            <label for="return-acceptance-time-range">时间范围</label>
+                            <select id="return-acceptance-time-range">
+                                <option value="all">全部</option>
+                                <option value="today">今天</option>
+                                <option value="7d">近 7 天</option>
+                                <option value="30d">近 30 天</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <button type="button" onclick="loadReturnAcceptances()">查询验收记录</button>
+                        </div>
+                        <div class="form-group">
+                            <button type="button" onclick="downloadFilteredReturnAcceptancesExport()">导出当前验收记录</button>
+                        </div>
+                    </div>
+                    <div class="records-summary" id="return-acceptances-summary"></div>
+                    <div class="records-list" id="return-acceptances-list"></div>
+                    <div id="return-acceptances-status"></div>
+                `;
+
+                const assetChangesPanel = document.getElementById('asset-changes');
+                if (assetChangesPanel) {
+                    assetChangesPanel.parentNode.insertBefore(acceptancePanel, assetChangesPanel);
+                }
+            }
+        }
+
         document.addEventListener('DOMContentLoaded', () => {
             setupBorrowRequestPages();
+            setupReturnAcceptancePage();
             document.querySelectorAll('.tab').forEach(tab => {
                 tab.addEventListener('click', () => setActiveTab(tab.getAttribute('data-tab')));
             });
@@ -870,6 +977,7 @@
             loadBorrowApprovals();
             loadAssets();
             loadDashboard();
+            loadReturnAcceptances();
         });
 
         function setActiveTab(tabId) {
@@ -901,6 +1009,10 @@
                 loadRecords();
             }
 
+            if (tabId === 'return-acceptances') {
+                loadReturnAcceptances();
+            }
+
             if (tabId === 'asset-changes') {
                 loadAssetChanges();
             }
@@ -918,6 +1030,44 @@
             const element = document.getElementById(elementId);
             element.textContent = message;
             element.className = `status ${tone}`;
+        }
+
+        function formatApiValidationDetail(detail) {
+            if (!Array.isArray(detail) || !detail.length) {
+                return '';
+            }
+
+            return detail.map(item => {
+                const location = Array.isArray(item.loc) ? item.loc[item.loc.length - 1] : 'field';
+                const label = RETURN_ACCEPTANCE_FIELD_LABELS[location] || location;
+                const message = item && item.msg ? item.msg : 'invalid value';
+                return `${label}: ${message}`;
+            }).join('；');
+        }
+
+        function formatApiResultMessage(result, fallbackMessage) {
+            if (!result) {
+                return fallbackMessage;
+            }
+
+            if (typeof result.message === 'string' && result.message.trim()) {
+                return result.message.trim();
+            }
+
+            if (typeof result.detail === 'string' && result.detail.trim()) {
+                return result.detail.trim();
+            }
+
+            const validationMessage = formatApiValidationDetail(result.detail);
+            if (validationMessage) {
+                return `参数校验失败：${validationMessage}`;
+            }
+
+            if (typeof result.code === 'string' && result.code.trim()) {
+                return result.code.trim();
+            }
+
+            return fallbackMessage;
         }
 
         function initializeInboundForm() {
@@ -1190,11 +1340,159 @@
             ]);
         }
 
+        function prefillReturnAcceptanceAsset(assetId) {
+            const normalizedAssetId = (assetId || '').trim();
+            if (!normalizedAssetId) {
+                return;
+            }
+
+            const formInput = document.getElementById('return-acceptance-asset-id');
+            const filterInput = document.getElementById('return-acceptance-filter-asset-id');
+            if (formInput) {
+                formInput.value = normalizedAssetId;
+            }
+            if (filterInput && !filterInput.value.trim()) {
+                filterInput.value = normalizedAssetId;
+            }
+        }
+
+        function buildReturnAcceptanceQueryParams() {
+            const assetId = document.getElementById('return-acceptance-filter-asset-id').value.trim();
+            const acceptanceResult = document.getElementById('return-acceptance-filter-result').value;
+            const acceptedByUserId = document.getElementById('return-acceptance-filter-user-id').value.trim();
+            const timeRange = document.getElementById('return-acceptance-time-range').value || 'all';
+            const params = new URLSearchParams();
+
+            if (assetId) {
+                params.set('asset_id', assetId);
+            }
+            if (acceptanceResult) {
+                params.set('acceptance_result', acceptanceResult);
+            }
+            if (acceptedByUserId) {
+                params.set('accepted_by_user_id', acceptedByUserId);
+            }
+            params.set('time_range', timeRange);
+            return params;
+        }
+
+        function downloadFilteredReturnAcceptancesExport() {
+            triggerDownload(`${API_BASE_URL}/export/return-acceptances.csv?${buildReturnAcceptanceQueryParams().toString()}`);
+        }
+
+        async function submitReturnAcceptance() {
+            const assetId = document.getElementById('return-acceptance-asset-id').value.trim();
+            const acceptedByUserId = document.getElementById('return-acceptance-user-id').value.trim();
+            const acceptedByUserName = document.getElementById('return-acceptance-user-name').value.trim();
+            const acceptanceResult = document.getElementById('return-acceptance-result').value;
+            const note = document.getElementById('return-acceptance-note').value.trim();
+
+            if (!assetId || !acceptedByUserId || !acceptedByUserName || !acceptanceResult) {
+                setStatusText('return-acceptance-status', '验收提交失败：请填写资产ID、验收人信息，并选择验收结果。', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/return-acceptances`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        asset_id: assetId,
+                        accepted_by_user_id: acceptedByUserId,
+                        accepted_by_user_name: acceptedByUserName,
+                        acceptance_result: acceptanceResult,
+                        note: note || null,
+                    })
+                });
+
+                const result = await response.json().catch(() => null);
+                const message = formatApiResultMessage(result, `HTTP ${response.status}`);
+                const isSuccess = result && result.success === true;
+
+                if (isSuccess) {
+                    document.getElementById('return-acceptance-filter-asset-id').value = assetId;
+                    document.getElementById('return-acceptance-filter-result').value = acceptanceResult;
+                    document.getElementById('return-acceptance-filter-user-id').value = acceptedByUserId;
+                    setStatusText('return-acceptance-status', `验收提交成功：${message}`, 'success');
+                    await loadReturnAcceptances();
+                    return;
+                }
+
+                setStatusText('return-acceptance-status', `验收提交失败：${message}`, 'error');
+            } catch (error) {
+                setStatusText('return-acceptance-status', `验收提交失败：${error.message}`, 'error');
+            }
+        }
+
+        async function loadReturnAcceptances() {
+            const summary = document.getElementById('return-acceptances-summary');
+            const list = document.getElementById('return-acceptances-list');
+            const status = document.getElementById('return-acceptances-status');
+            if (!summary || !list || !status) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/return-acceptances?${buildReturnAcceptanceQueryParams().toString()}`);
+                const payload = await response.json().catch(() => null);
+
+                if (!response.ok || !payload) {
+                    throw new Error(formatApiResultMessage(payload, '验收记录加载失败'));
+                }
+
+                renderReturnAcceptances(payload);
+                status.innerHTML = '';
+                status.className = '';
+            } catch (error) {
+                summary.textContent = '';
+                list.innerHTML = `<div class="dashboard-empty">验收记录加载失败: ${error.message}</div>`;
+                status.textContent = `验收记录加载失败：${error.message}`;
+                status.className = 'status error';
+            }
+        }
+
+        function renderReturnAcceptances(payload) {
+            const filters = payload.filters || {};
+            const items = payload.items || [];
+            const total = payload.total || 0;
+
+            document.getElementById('return-acceptance-filter-asset-id').value = filters.asset_id || '';
+            document.getElementById('return-acceptance-filter-result').value = filters.acceptance_result || '';
+            document.getElementById('return-acceptance-filter-user-id').value = filters.accepted_by_user_id || '';
+            document.getElementById('return-acceptance-time-range').value = filters.time_range || 'all';
+            document.getElementById('return-acceptances-summary').textContent = `共 ${total} 条验收记录`;
+
+            const list = document.getElementById('return-acceptances-list');
+            if (!items.length) {
+                list.innerHTML = '<div class="dashboard-empty">暂无匹配验收记录</div>';
+                return;
+            }
+
+            list.innerHTML = items.map(item => `
+                <div class="record-item">
+                    <h3>${item.asset_id || '-'}</h3>
+                    <div class="record-grid">
+                        <p><strong>验收结果:</strong> ${item.acceptance_result || '-'}</p>
+                        <p><strong>备注:</strong> ${item.note || '-'}</p>
+                        <p><strong>验收人ID:</strong> ${item.accepted_by_user_id || '-'}</p>
+                        <p><strong>验收人姓名:</strong> ${item.accepted_by_user_name || '-'}</p>
+                        <p><strong>验收时间:</strong> ${item.accepted_at || '-'}</p>
+                        <p><strong>关联归还 request_seq:</strong> ${item.related_return_request_seq || '-'}</p>
+                        <p><strong>关联归还 request_id:</strong> ${item.related_return_request_id || '-'}</p>
+                        <p><strong>关联归还 hw_seq:</strong> ${item.related_return_hw_seq || '-'}</p>
+                    </div>
+                </div>
+            `).join('');
+        }
+
         async function submitBorrowRequest() {
             const assetId = document.getElementById('borrow-request-asset-id').value.trim();
             const userId = document.getElementById('borrow-request-user-id').value.trim();
             const userName = document.getElementById('borrow-request-user-name').value.trim();
             const reason = document.getElementById('borrow-request-reason').value.trim();
+            const requestedDaysRaw = document.getElementById('borrow-request-days').value.trim();
 
             if (!assetId || !userId || !userName) {
                 setStatusText('borrow-status', '借用申请失败：请填写资产ID、借用人ID和借用人姓名。', 'error');
@@ -1212,12 +1510,14 @@
                         user_id: userId,
                         user_name: userName,
                         reason: reason || null,
+                        requested_days: requestedDaysRaw ? Number(requestedDaysRaw) : null,
                     })
                 });
-                const result = await response.json();
-                const message = result.message || result.detail || '未知错误';
-                setStatusText('borrow-status', `${result.success ? '借用申请成功' : '借用申请失败'}：${message}`, result.success ? 'success' : 'error');
-                if (result.success) {
+                const result = await response.json().catch(() => null);
+                const message = formatApiResultMessage(result, `HTTP ${response.status}`);
+                const isSuccess = result && result.success === true;
+                setStatusText('borrow-status', `${isSuccess ? '借用申请成功' : '借用申请失败'}：${message}`, isSuccess ? 'success' : 'error');
+                if (isSuccess) {
                     await refreshBorrowRequestViews();
                 }
             } catch (error) {
@@ -1273,6 +1573,7 @@
                         <p><strong>申请状态:</strong> ${item.status || '-'}</p>
                         <p><strong>借用人ID:</strong> ${item.applicant_user_id || '-'}</p>
                         <p><strong>借用人姓名:</strong> ${item.applicant_user_name || '-'}</p>
+                        <p><strong>借用天数:</strong> ${item.requested_days || '-'}</p>
                         <p><strong>申请理由:</strong> ${item.reason || '-'}</p>
                         <p><strong>申请时间:</strong> ${item.requested_at || '-'}</p>
                         <p><strong>审批人ID:</strong> ${item.reviewer_user_id || '-'}</p>
@@ -1346,6 +1647,7 @@
                             <p><strong>申请状态:</strong> ${item.status || '-'}</p>
                             <p><strong>借用人ID:</strong> ${item.applicant_user_id || '-'}</p>
                             <p><strong>借用人姓名:</strong> ${item.applicant_user_name || '-'}</p>
+                            <p><strong>借用天数:</strong> ${item.requested_days || '-'}</p>
                             <p><strong>申请理由:</strong> ${item.reason || '-'}</p>
                             <p><strong>申请时间:</strong> ${item.requested_at || '-'}</p>
                             <p><strong>审批人ID:</strong> ${item.reviewer_user_id || '-'}</p>
@@ -1614,6 +1916,8 @@
                     document.getElementById('return-status').innerHTML = `归还成功: ${result.message}`;
                     document.getElementById('return-status').className = 'status success';
                     await loadAssets();
+                    prefillReturnAcceptanceAsset(assetId);
+                    await loadReturnAcceptances();
                 } else {
                     document.getElementById('return-status').innerHTML = `归还失败: ${returnMessage}`;
                     document.getElementById('return-status').className = 'status error';
@@ -1983,6 +2287,7 @@
             const filters = dashboard.filters || {};
             const summary = dashboard.summary || {};
             const operationStats = dashboard.operation_stats || {};
+            const exceptionStats = dashboard.exception_stats || {};
             const borrowTopAssets = dashboard.borrow_top_assets || [];
             const timeRangeSelect = document.getElementById('dashboard-time-range');
 
@@ -2006,6 +2311,10 @@
                 <div class="dashboard-card">
                     <h3>报废资产</h3>
                     <div class="dashboard-value">${summary.scrapped || 0}</div>
+                </div>
+                <div class="dashboard-card">
+                    <h3>Overdue</h3>
+                    <div class="dashboard-value">${exceptionStats.overdue_count || 0}</div>
                 </div>
             `;
 

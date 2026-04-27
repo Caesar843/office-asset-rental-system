@@ -57,6 +57,20 @@ class BorrowRequestStatus(str, Enum):
     CONSUMED = "CONSUMED"
 
 
+class RoleType(str, Enum):
+    ADMIN = "ADMIN"
+    BORROWER = "BORROWER"
+
+
+class AcceptanceResult(str, Enum):
+    NORMAL = "NORMAL"
+    DAMAGED = "DAMAGED"
+    MISSING_PARTS = "MISSING_PARTS"
+
+
+DEFAULT_MAX_BORROW_DAYS = 30
+
+
 def _validate_command_fields(asset_id: str, user_id: str, user_name: str, timeout_ms: int) -> None:
     if not asset_id.strip():
         raise ValueError("asset_id 不能为空")
@@ -134,6 +148,7 @@ class BorrowRequestCreateCommand:
     user_id: str
     user_name: str
     reason: str | None = None
+    requested_days: int | None = None
     requested_at: str | None = None
 
     def __post_init__(self) -> None:
@@ -141,6 +156,8 @@ class BorrowRequestCreateCommand:
         self.user_id = self.user_id.strip()
         self.user_name = self.user_name.strip()
         self.reason = _normalize_optional_text(self.reason)
+        if self.requested_days is not None:
+            self.requested_days = int(self.requested_days)
         self.requested_at = _normalize_optional_text(self.requested_at)
         if not self.asset_id:
             raise ValueError("asset_id 涓嶈兘涓虹┖")
@@ -148,6 +165,8 @@ class BorrowRequestCreateCommand:
             raise ValueError("user_id 涓嶈兘涓虹┖")
         if not self.user_name:
             raise ValueError("user_name 涓嶈兘涓虹┖")
+        if self.requested_days is not None and self.requested_days <= 0:
+            raise ValueError("requested_days must be positive")
 
 
 @dataclass(slots=True)
@@ -171,6 +190,27 @@ class BorrowApprovalCommand:
             raise ValueError("reviewer_user_id 涓嶈兘涓虹┖")
         if not self.reviewer_user_name:
             raise ValueError("reviewer_user_name 涓嶈兘涓虹┖")
+
+
+@dataclass(slots=True)
+class ReturnAcceptanceCreateCommand:
+    asset_id: str
+    accepted_by_user_id: str
+    accepted_by_user_name: str
+    acceptance_result: AcceptanceResult
+    note: str | None = None
+
+    def __post_init__(self) -> None:
+        self.asset_id = self.asset_id.strip()
+        self.accepted_by_user_id = self.accepted_by_user_id.strip()
+        self.accepted_by_user_name = self.accepted_by_user_name.strip()
+        self.note = _normalize_optional_text(self.note)
+        if not self.asset_id:
+            raise ValueError("asset_id 娑撳秷鍏樻稉铏光敄")
+        if not self.accepted_by_user_id:
+            raise ValueError("accepted_by_user_id 娑撳秷鍏樻稉铏光敄")
+        if not self.accepted_by_user_name:
+            raise ValueError("accepted_by_user_name 娑撳秷鍏樻稉铏光敄")
 
 
 @dataclass(slots=True)
@@ -279,6 +319,7 @@ class BorrowRequestCreateInput:
     applicant_user_id: str
     applicant_user_name: str
     reason: str | None
+    requested_days: int
     status: BorrowRequestStatus
     requested_at: str
 
@@ -300,6 +341,7 @@ class BorrowRequestRecord:
     applicant_user_id: str
     applicant_user_name: str
     reason: str | None
+    requested_days: int
     status: BorrowRequestStatus
     reviewer_user_id: str | None = None
     reviewer_user_name: str | None = None
@@ -320,6 +362,68 @@ class BorrowRequestActionResult:
     code: str
     message: str
     item: BorrowRequestRecord | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "code": self.code,
+            "message": self.message,
+            "item": None if self.item is None else self.item.to_dict(),
+        }
+
+
+@dataclass(slots=True)
+class OperationTraceRecord:
+    asset_id: str
+    action_type: ActionType
+    user_id: str
+    user_name: str
+    op_time: str | None
+    request_seq: int | None
+    request_id: str | None
+    hw_seq: int | None
+    hw_result: str | None
+    hw_sn: str | None = None
+
+
+@dataclass(slots=True)
+class ReturnAcceptanceCreateInput:
+    asset_id: str
+    acceptance_result: AcceptanceResult
+    note: str | None
+    accepted_by_user_id: str
+    accepted_by_user_name: str
+    accepted_at: str
+    related_return_request_seq: int | None
+    related_return_request_id: str | None
+    related_return_hw_seq: int | None
+
+
+@dataclass(slots=True)
+class ReturnAcceptanceRecord:
+    id: int
+    asset_id: str
+    acceptance_result: AcceptanceResult
+    note: str | None
+    accepted_by_user_id: str
+    accepted_by_user_name: str
+    accepted_at: str
+    related_return_request_seq: int | None = None
+    related_return_request_id: str | None = None
+    related_return_hw_seq: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["acceptance_result"] = self.acceptance_result.value
+        return payload
+
+
+@dataclass(slots=True)
+class ReturnAcceptanceActionResult:
+    success: bool
+    code: str
+    message: str
+    item: ReturnAcceptanceRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

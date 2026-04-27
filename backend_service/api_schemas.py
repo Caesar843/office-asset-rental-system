@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from models import AcceptanceResult
+
 
 def _strip_required_text(value: str) -> str:
     stripped = value.strip()
@@ -53,6 +55,7 @@ class BorrowRequestCreateBody(BaseModel):
     user_id: str = Field(..., description="Applicant user ID")
     user_name: str = Field(..., description="Applicant user name")
     reason: str | None = Field(None, description="Borrow request reason")
+    requested_days: int | None = Field(None, gt=0, description="Requested borrow duration in days")
 
     @field_validator("asset_id", "user_id", "user_name")
     @classmethod
@@ -73,6 +76,19 @@ class BorrowRequestReviewBody(BaseModel):
 
 class BorrowRequestStartBorrowBody(BaseModel):
     timeout_ms: int = Field(30000, gt=0, description="Hardware wait timeout in milliseconds")
+
+
+class ReturnAcceptanceCreateBody(BaseModel):
+    asset_id: str = Field(..., description="Asset ID")
+    accepted_by_user_id: str = Field(..., description="Acceptance operator user ID")
+    accepted_by_user_name: str = Field(..., description="Acceptance operator user name")
+    acceptance_result: AcceptanceResult = Field(..., description="Return acceptance result")
+    note: str | None = Field(None, description="Acceptance note")
+
+    @field_validator("asset_id", "accepted_by_user_id", "accepted_by_user_name")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        return _strip_required_text(value)
 
 
 class ScanResultRequestBody(BaseModel):
@@ -109,6 +125,7 @@ class BorrowRequestRecordResponse(BaseModel):
     applicant_user_id: str
     applicant_user_name: str
     reason: str | None = None
+    requested_days: int
     status: str
     reviewer_user_id: str | None = None
     reviewer_user_name: str | None = None
@@ -123,6 +140,26 @@ class BorrowRequestActionResponse(BaseModel):
     code: str
     message: str
     item: BorrowRequestRecordResponse | None = None
+
+
+class ReturnAcceptanceRecordResponse(BaseModel):
+    id: int
+    asset_id: str
+    acceptance_result: str
+    note: str | None = None
+    accepted_by_user_id: str
+    accepted_by_user_name: str
+    accepted_at: str
+    related_return_request_seq: int | None = None
+    related_return_request_id: str | None = None
+    related_return_hw_seq: int | None = None
+
+
+class ReturnAcceptanceActionResponse(BaseModel):
+    success: bool
+    code: str
+    message: str
+    item: ReturnAcceptanceRecordResponse | None = None
 
 
 class AssetSnapshotResponse(BaseModel):

@@ -8,15 +8,15 @@
 
 2. 适用范围
 
-本设计书适用于当前 V1 版本的借出与归还核心闭环，不将入库流程视为本阶段已正式落地的契约范围。原因如下：
+本设计书建立时，V1 稳定主链主要围绕借出与归还核心闭环展开；这一历史基线仍是理解服务层分层边界与早期对象设计的前提。
 
-第一，当前代码模型中的 ActionType 仅定义了 BORROW 与 RETURN 两种动作类型。
-第二，当前服务层实现仅提供借出确认与归还确认两类服务入口。
-因此，本阶段服务层内部契约的正式范围定义为：
+在当前代码与后续入库补充契约生效后，INBOUND 已纳入当前正式实现范围。真实代码中，ActionType 已包含 INBOUND，models.py 已定义 InboundCommand 与 InboundCommitInput，service.py 已提供 request_inbound / request_asset_inbound_confirm 两类正式入库服务入口，api_app.py 已接入 /transactions/inbound。
 
-借出确认链路 + 归还确认链路
+因此，本设计书当前的正式适用范围应理解为：
 
-入库流程仅作为后续扩展预留，不纳入本设计书的正式对象清单与强制约束。
+借出确认链路 + 归还确认链路 + 入库确认链路
+
+若后文出现“Borrow / Return 基线”表述，应解释为历史稳定起点，而不再代表对当前入库正式实现范围的排除。
 
 3. 设计原则
 3.1 单一事实源原则
@@ -56,6 +56,7 @@ hw_result：硬件确认结果
 
 BORROW
 RETURN
+INBOUND
 
 协议侧示例 payload 已明确使用 action_type 字段传输动作语义，服务层与 MCU 上报结果中必须保持一致。
 
@@ -88,6 +89,8 @@ HW_RESULT_TIMEOUT
 DEVICE_OFFLINE
 ASSET_NOT_FOUND
 STATE_INVALID
+PARAM_INVALID
+PERMISSION_DENIED
 INTERNAL_ERROR
 
 该结果码体系同时覆盖三类语义：
@@ -154,6 +157,32 @@ timeout_ms: int = 30000
 约束规则
 约束与借出命令对象一致
 动作类型固定解释为 RETURN
+5.3 入库命令对象 InboundCommand
+定义目的
+
+表示一笔入库确认业务请求。
+
+必备字段
+asset_id: str
+user_id: str
+user_name: str
+asset_name: str
+category_id: int | None
+location: str
+timeout_ms: int = 30000
+可选补充字段
+request_source: str | None
+raw_text: str | None
+symbology: str | None
+约束规则
+asset_id 不得为空
+user_id 不得为空
+user_name 不得为空
+asset_name 不得为空
+location 不得为空
+category_id 若存在则必须为正整数
+timeout_ms 必须为正整数
+动作类型固定解释为 INBOUND
 6. 待确认事务对象设计
 
 待确认事务对象是服务层内部的核心对象，用于承载一笔尚未完成硬件确认与数据库提交的业务事务。
@@ -186,7 +215,7 @@ error_message
 asset_id：资产唯一标识
 user_id：操作者唯一标识
 user_name：操作者展示名称
-action_type：事务动作，取值仅允许 BORROW / RETURN
+action_type：事务动作，当前正式取值为 BORROW / RETURN / INBOUND；其中 Borrow / Return 是历史稳定基线，Inbound 是当前已正式接入动作
 事务关联字段
 request_id：服务层生成的随机请求标识，当前通过 uuid.uuid4().hex 生成，用于提升事件匹配的抗串单能力。
 request_seq：服务层主事务序号，也是串口请求的主关联号。当前由 SerialManager.reserve_seq_id() 预留并作为发送帧的 seq_id 使用。
@@ -299,11 +328,12 @@ timestamp: int
 
 8. 数据库提交对象设计
 
-数据库提交对象是服务层向 Repository 发起原子落库时唯一允许使用的正式入参对象。
+数据库提交对象是服务层向 Repository 发起原子落库时允许使用的正式入参对象集合。Borrow / Return 沿用 OperationRecordInput，Inbound 使用 InboundCommitInput。
 
 8.1 对象名称
 
-OperationRecordInput
+OperationRecordInput（Borrow / Return）
+InboundCommitInput（Inbound）
 
 8.2 已有实现字段
 
@@ -319,8 +349,24 @@ hw_seq
 hw_result
 hw_sn
 due_time
+borrow_request_id
+当前代码中 InboundCommitInput 包含：
+
+asset_id
+asset_name
+category_id
+location
+user_id
+user_name
+request_seq
+request_id
+hw_seq
+hw_result
+hw_sn
+op_time
+并通过只读 action_type 属性固定解释为 INBOUND
 8.3 字段语义
-必填字段
+Borrow / Return 提交边界的必填字段
 asset_id
 user_id
 user_name
@@ -328,20 +374,36 @@ action_type
 request_seq
 hw_seq
 hw_result
-可空字段
+Borrow / Return 可空字段
 request_id
 hw_sn
 due_time
+borrow_request_id
+Inbound 提交边界的必填字段
+asset_id
+asset_name
+location
+user_id
+user_name
+request_seq
+hw_seq
+hw_result
+op_time
+Inbound 可空字段
+category_id
+request_id
+hw_sn
 8.4 提交约束
 hw_seq 为空时不得提交数据库，服务层必须直接失败收口。当前 _finalize_transaction() 已按该规则实现。
 hw_result 必须来源于已成功匹配到的 EVT_USER_ACTION.confirm_result
 request_seq 必须来源于当前待确认事务
-action_type 必须与待确认事务一致
+Borrow / Return 的 action_type 必须与待确认事务一致；Inbound 的提交对象通过只读 action_type 固定为 INBOUND
 due_time 在当前 V1 阶段可允许为空；数据库模型保留该字段，作为后续借期规则扩展入口。
+Inbound 提交前还必须确保 asset_name 与 location 已在事务 extra 中收齐，并通过 op_time 固化本次入库操作时间。
 8.5 与数据库模型的映射关系
 
 数据库模型要求业务流水表 operation_records 能将资产、用户与硬件确认三者绑定，特别要求记录 hw_seq 与 hw_result。
-因此 OperationRecordInput 必须被视为服务层到持久化层的唯一正式桥接对象。
+因此，OperationRecordInput 与 InboundCommitInput 必须被视为服务层到持久化层的正式桥接对象：前者承载 Borrow / Return 的原子提交，后者承载 Inbound 的原子提交。
 
 9. 统一业务结果对象设计
 
@@ -493,10 +555,11 @@ TIMEOUT
 
 12. 原子提交契约
 
-服务层在收到硬件确认成功结果后，必须通过唯一正式提交对象 OperationRecordInput 调用 Repository 的原子提交接口。当前仓储接口已定义：
+服务层在收到硬件确认成功结果后，必须通过与动作类型一致的正式提交对象调用 Repository 的原子提交接口。当前仓储接口已定义：
 
 get_asset_status(asset_id)
 apply_operation_atomically(record)
+apply_inbound_atomically(commit)
 rollback_transaction(asset_id, reason)
 
 原子提交的逻辑边界必须满足以下要求：
@@ -519,10 +582,10 @@ rollback_transaction(asset_id, reason)
 其四，事务匹配规则已经在服务实现中落地，采用 request_seq + request_id + asset_id + action_type 的联合校验方式，满足当前联调稳定性要求。
 其五，状态机主链已经形成，符合协议与架构文件中“先 ACK、后硬件确认、再数据库更新”的两阶段确认逻辑。
 
-当前仍需在实现层补足的内容，不属于契约缺失，而属于对象显式化不足：即命令对象 BorrowCommand / ReturnCommand 与事件对象 HardwareUserActionEvent 仍主要以内联参数和 payload 拆解形式存在，后续编码阶段应予以类结构化。
+当前代码已补足对象显式化：BorrowCommand / ReturnCommand / InboundCommand、HardwareUserActionEvent、OperationRecordInput / InboundCommitInput 均已具备类结构化定义。后续维护若再引用“对象显式化不足”结论，只能作为文档建立阶段的历史说明，不能再视为当前代码事实。
 
 14. 正式结论
 
 本设计书将当前 V1 版本服务层内部契约正式定义为：
 
-服务层以 BorrowCommand 与 ReturnCommand 作为正式请求命令对象，以 PendingTransaction 作为待确认事务核心对象，以 SendResult/HardwareAckResult 与 HardwareUserActionEvent 作为硬件事件契约，以 OperationRecordInput 作为唯一正式原子提交对象，以 BusinessResult 作为统一业务出参对象；事务关联必须以 request_seq + request_id + asset_id + action_type 为核心匹配规则，状态推进必须遵循 WAIT_ACK → WAIT_HW → UPDATING → COMPLETED/FAILED 的正式状态语义，并保证 hw_seq 与 hw_result 最终可关联落入业务流水表 operation_records，从而满足赛题对软硬件闭环与关键记录可追溯的要求。
+服务层以 BorrowCommand、ReturnCommand 与 InboundCommand 作为正式请求命令对象，以 PendingTransaction 作为待确认事务核心对象，以 SendResult/HardwareAckResult 与 HardwareUserActionEvent 作为硬件事件契约，以 OperationRecordInput（Borrow / Return）与 InboundCommitInput（Inbound）作为正式原子提交对象，以 BusinessResult 作为统一业务出参对象；事务关联必须以 request_seq + request_id + asset_id + action_type 为核心匹配规则，状态推进必须遵循 WAIT_ACK → WAIT_HW → UPDATING → COMPLETED/FAILED 的正式状态语义，并保证 hw_seq 与 hw_result 最终可关联落入业务流水表 operation_records，从而满足赛题对软硬件闭环与关键记录可追溯的要求。Borrow / Return 仍是历史稳定基线，但已不再构成对 Inbound 当前正式实现范围的排除。

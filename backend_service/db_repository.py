@@ -10,13 +10,19 @@ from typing import Any, Callable
 
 from asset_lifecycle import next_asset_status_for_action, validate_asset_transition
 from models import (
+    AcceptanceResult,
+    ActionType,
     AssetStatus,
     BorrowRequestCreateInput,
     BorrowRequestRecord,
     BorrowRequestReviewInput,
     BorrowRequestStatus,
+    DEFAULT_MAX_BORROW_DAYS,
     InboundCommitInput,
+    OperationTraceRecord,
     OperationRecordInput,
+    ReturnAcceptanceCreateInput,
+    ReturnAcceptanceRecord,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -28,13 +34,21 @@ ASSET_STATUS_TO_DB = {
     AssetStatus.SCRAPPED: 3,
 }
 DB_STATUS_TO_ASSET = {value: key for key, value in ASSET_STATUS_TO_DB.items()}
-REQUIRED_TABLES = ("assets", "users", "categories", "operation_records", "borrow_requests")
+REQUIRED_TABLES = (
+    "assets",
+    "users",
+    "categories",
+    "operation_records",
+    "borrow_requests",
+    "return_acceptance_records",
+)
 BORROW_REQUEST_COLUMNS = (
     "request_id",
     "asset_id",
     "applicant_user_id",
     "applicant_user_name",
     "reason",
+    "requested_days",
     "status",
     "reviewer_user_id",
     "reviewer_user_name",
@@ -43,6 +57,46 @@ BORROW_REQUEST_COLUMNS = (
     "reviewed_at",
     "consumed_at",
 )
+RETURN_ACCEPTANCE_COLUMNS = (
+    "id",
+    "asset_id",
+    "acceptance_result",
+    "note",
+    "accepted_by_user_id",
+    "accepted_by_user_name",
+    "accepted_at",
+    "related_return_request_seq",
+    "related_return_request_id",
+    "related_return_hw_seq",
+)
+REQUIRED_OPERATION_RECORD_TRACE_COLUMNS = (
+    "request_seq",
+    "request_id",
+    "hw_seq",
+    "hw_result",
+    "hw_sn",
+)
+REQUIRED_INBOUND_ASSET_COLUMNS = (
+    "id",
+    "asset_name",
+    "qr_code",
+    "status",
+    "location",
+)
+REQUIRED_BUSINESS_USER_COLUMNS = (
+    "user_id",
+    "user_name",
+    "student_id",
+)
+DEFAULT_INBOUND_ADMIN_USER_IDS = ("ADMIN", "U-ADMIN")
+
+
+def _load_inbound_admin_user_ids() -> set[str]:
+    raw = os.getenv("BACKEND_ADMIN_USER_IDS") or os.getenv("BACKEND_INBOUND_ADMIN_USER_IDS") or ""
+    configured = {item.strip() for item in raw.split(",") if item.strip()}
+    if configured:
+        return configured
+    return set(DEFAULT_INBOUND_ADMIN_USER_IDS)
 
 
 @dataclass(slots=True)
@@ -162,8 +216,8 @@ class SqlTransactionRepository:
             placeholder = self._placeholder
             sql = (
                 "INSERT INTO borrow_requests ("
-                + ", ".join(BORROW_REQUEST_COLUMNS[:6] + ("requested_at",))
-                + f") VALUES ({', '.join(placeholder for _ in range(7))})"
+                + ", ".join(BORROW_REQUEST_COLUMNS[:7] + ("requested_at",))
+                + f") VALUES ({', '.join(placeholder for _ in range(8))})"
             )
             cursor.execute(
                 sql,
@@ -173,6 +227,7 @@ class SqlTransactionRepository:
                     request.applicant_user_id,
                     request.applicant_user_name,
                     request.reason,
+                    request.requested_days,
                     request.status.value,
                     request.requested_at,
                 ),
@@ -184,6 +239,7 @@ class SqlTransactionRepository:
                 applicant_user_id=request.applicant_user_id,
                 applicant_user_name=request.applicant_user_name,
                 reason=request.reason,
+                requested_days=request.requested_days,
                 status=request.status,
                 requested_at=request.requested_at,
             )
@@ -270,6 +326,7 @@ class SqlTransactionRepository:
                 applicant_user_id=current_record.applicant_user_id,
                 applicant_user_name=current_record.applicant_user_name,
                 reason=current_record.reason,
+                requested_days=current_record.requested_days,
                 status=review.status,
                 reviewer_user_id=review.reviewer_user_id,
                 reviewer_user_name=review.reviewer_user_name,
@@ -284,7 +341,153 @@ class SqlTransactionRepository:
         finally:
             connection.close()
 
-    def probe(self) -> RepositoryProbeResult:
+    def get_latest_operation_record(self, asset_id: str) -> OperationTraceRecord | None:
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            asset_row = self._resolve_asset_row(cursor, asset_id, for_update=False)
+            if asset_row is None:
+                return None
+
+            placeholder = self._placeholder
+            cursor.execute(
+                (
+                    "SELECT * FROM operation_records WHERE asset_id = "
+                    f"{placeholder} ORDER BY op_time DESC, op_id DESC LIMIT 1"
+                ),
+                (asset_row[0],),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return self._operation_row_to_trace_record(cursor, asset_row, row)
+        finally:
+            connection.close()
+
+    def create_return_acceptance(self, record: ReturnAcceptanceCreateInput) -> ReturnAcceptanceRecord:
+        connection = self._connect()
+        self._begin_transaction(connection)
+        try:
+            cursor = connection.cursor()
+            placeholder = self._placeholder
+            sql = (
+                "INSERT INTO return_acceptance_records ("
+                + ", ".join(RETURN_ACCEPTANCE_COLUMNS[1:])
+                + f") VALUES ({', '.join(placeholder for _ in range(len(RETURN_ACCEPTANCE_COLUMNS) - 1))})"
+            )
+            cursor.execute(
+                sql,
+                (
+                    record.asset_id,
+                    record.acceptance_result.value,
+                    record.note,
+                    record.accepted_by_user_id,
+                    record.accepted_by_user_name,
+                    record.accepted_at,
+                    record.related_return_request_seq,
+                    record.related_return_request_id,
+                    record.related_return_hw_seq,
+                ),
+            )
+            acceptance_id = getattr(cursor, "lastrowid", None)
+            if acceptance_id is None:
+                cursor.execute(
+                    (
+                        "SELECT " + ", ".join(RETURN_ACCEPTANCE_COLUMNS) + " FROM return_acceptance_records "
+                        f"WHERE asset_id = {placeholder} AND related_return_hw_seq = {placeholder} "
+                        "ORDER BY id DESC LIMIT 1"
+                    ),
+                    (record.asset_id, record.related_return_hw_seq),
+                )
+                stored_row = cursor.fetchone()
+                if stored_row is None:
+                    raise RuntimeError("failed to resolve return acceptance record after insert")
+                created = self._return_acceptance_tuple_to_record(stored_row)
+                connection.commit()
+                return created
+
+            connection.commit()
+            return ReturnAcceptanceRecord(
+                id=int(acceptance_id),
+                asset_id=record.asset_id,
+                acceptance_result=record.acceptance_result,
+                note=record.note,
+                accepted_by_user_id=record.accepted_by_user_id,
+                accepted_by_user_name=record.accepted_by_user_name,
+                accepted_at=record.accepted_at,
+                related_return_request_seq=record.related_return_request_seq,
+                related_return_request_id=record.related_return_request_id,
+                related_return_hw_seq=record.related_return_hw_seq,
+            )
+        except Exception as exc:
+            self._rollback_connection(connection, reason=str(exc))
+            lowered = str(exc).lower()
+            if "return_acceptance_records" in lowered and "unique" in lowered:
+                raise ValueError("the latest return has already been accepted") from exc
+            raise
+        finally:
+            connection.close()
+
+    def list_return_acceptances(
+        self,
+        *,
+        asset_id: str | None = None,
+        acceptance_result: AcceptanceResult | None = None,
+        accepted_by_user_id: str | None = None,
+    ) -> list[ReturnAcceptanceRecord]:
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            placeholder = self._placeholder
+            sql = "SELECT " + ", ".join(RETURN_ACCEPTANCE_COLUMNS) + " FROM return_acceptance_records"
+            clauses: list[str] = []
+            params: list[Any] = []
+            if asset_id:
+                clauses.append(f"asset_id = {placeholder}")
+                params.append(asset_id)
+            if acceptance_result is not None:
+                clauses.append(f"acceptance_result = {placeholder}")
+                params.append(acceptance_result.value)
+            if accepted_by_user_id:
+                clauses.append(f"accepted_by_user_id = {placeholder}")
+                params.append(accepted_by_user_id)
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY accepted_at DESC, id DESC"
+            cursor.execute(sql, tuple(params))
+            rows = cursor.fetchall()
+            return [self._return_acceptance_tuple_to_record(row) for row in rows]
+        finally:
+            connection.close()
+
+    def get_return_acceptance_by_related_return(
+        self,
+        *,
+        asset_id: str,
+        related_return_request_seq: int | None,
+        related_return_hw_seq: int | None,
+    ) -> ReturnAcceptanceRecord | None:
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            placeholder = self._placeholder
+            sql = "SELECT " + ", ".join(RETURN_ACCEPTANCE_COLUMNS) + " FROM return_acceptance_records"
+            clauses = [f"asset_id = {placeholder}"]
+            params: list[Any] = [asset_id]
+            if related_return_hw_seq is not None:
+                clauses.append(f"related_return_hw_seq = {placeholder}")
+                params.append(related_return_hw_seq)
+            if related_return_request_seq is not None:
+                clauses.append(f"related_return_request_seq = {placeholder}")
+                params.append(related_return_request_seq)
+            sql += " WHERE " + " AND ".join(clauses) + " ORDER BY id DESC LIMIT 1"
+            cursor.execute(sql, tuple(params))
+            row = cursor.fetchone()
+            return None if row is None else self._return_acceptance_tuple_to_record(row)
+        finally:
+            connection.close()
+
+    def probe(self, *, inbound_admin_user_ids: set[str] | None = None) -> RepositoryProbeResult:
         connection = None
         try:
             connection = self._connect()
@@ -296,10 +499,77 @@ class SqlTransactionRepository:
             if missing_tables:
                 errors.append(f"missing tables: {', '.join(missing_tables)}")
 
+            operation_record_columns: list[str] = []
+            missing_operation_record_trace_columns: list[str] = []
+            if "operation_records" in tables:
+                operation_record_columns = list(self._get_table_columns(cursor, "operation_records"))
+                missing_operation_record_trace_columns = [
+                    column for column in REQUIRED_OPERATION_RECORD_TRACE_COLUMNS if column not in operation_record_columns
+                ]
+                if missing_operation_record_trace_columns:
+                    errors.append(
+                        "operation_records missing required trace columns: "
+                        + ", ".join(missing_operation_record_trace_columns)
+                    )
+
+            asset_columns: list[str] = []
+            missing_inbound_asset_columns: list[str] = []
+            if "assets" in tables:
+                asset_columns = list(self._get_table_columns(cursor, "assets"))
+                missing_inbound_asset_columns = [
+                    column for column in REQUIRED_INBOUND_ASSET_COLUMNS if column not in asset_columns
+                ]
+                if missing_inbound_asset_columns:
+                    errors.append(
+                        "assets table missing inbound required columns: "
+                        + ", ".join(missing_inbound_asset_columns)
+                    )
+
+            user_columns: list[str] = []
+            missing_business_user_columns: list[str] = []
+            resolvable_business_user_count: int | None = None
+            configured_inbound_admin_user_ids = sorted(inbound_admin_user_ids or _load_inbound_admin_user_ids())
+            missing_inbound_admin_user_ids: list[str] = []
+            if "users" in tables:
+                user_columns = list(self._get_table_columns(cursor, "users"))
+                missing_business_user_columns = [
+                    column for column in REQUIRED_BUSINESS_USER_COLUMNS if column not in user_columns
+                ]
+                if missing_business_user_columns:
+                    errors.append(
+                        "users table missing business user resolution columns: "
+                        + ", ".join(missing_business_user_columns)
+                    )
+                else:
+                    resolvable_business_user_count = self._count_resolvable_business_users(cursor)
+                    if resolvable_business_user_count <= 0:
+                        errors.append("users table has no resolvable business user ids via student_id")
+                    missing_inbound_admin_user_ids = self._find_missing_business_user_ids(
+                        cursor,
+                        configured_inbound_admin_user_ids,
+                    )
+                    if missing_inbound_admin_user_ids:
+                        errors.append(
+                            "configured inbound admin business user ids not resolvable: "
+                            + ", ".join(missing_inbound_admin_user_ids)
+                        )
+
             details = {
                 "required_tables": list(REQUIRED_TABLES),
                 "tables_present": [name for name in REQUIRED_TABLES if name in tables],
                 "missing_tables": missing_tables,
+                "operation_records_columns": operation_record_columns,
+                "missing_operation_record_trace_columns": missing_operation_record_trace_columns,
+                "business_user_id_field": "student_id",
+                "inbound_required_asset_columns": list(REQUIRED_INBOUND_ASSET_COLUMNS),
+                "assets_columns": asset_columns,
+                "missing_inbound_asset_columns": missing_inbound_asset_columns,
+                "required_business_user_columns": list(REQUIRED_BUSINESS_USER_COLUMNS),
+                "users_columns": user_columns,
+                "missing_business_user_columns": missing_business_user_columns,
+                "resolvable_business_user_count": resolvable_business_user_count,
+                "configured_inbound_admin_user_ids": configured_inbound_admin_user_ids,
+                "missing_inbound_admin_user_ids": missing_inbound_admin_user_ids,
             }
             details.update(self._probe_backend_details(cursor))
 
@@ -448,23 +718,15 @@ class SqlTransactionRepository:
     def _resolve_asset_row(self, cursor: Any, asset_id: str, *, for_update: bool) -> tuple[Any, ...] | None:
         placeholder = self._placeholder
         lock_clause = self._select_for_update_clause if for_update else ""
-        sql = (
-            "SELECT id, status, qr_code "
-            f"FROM assets WHERE qr_code = {placeholder} OR {self._int_as_text_expr('id')} = {placeholder} "
-            f"ORDER BY CASE WHEN qr_code = {placeholder} THEN 0 ELSE 1 END LIMIT 1{lock_clause}"
-        )
-        cursor.execute(sql, (asset_id, asset_id, asset_id))
+        sql = f"SELECT id, status, qr_code FROM assets WHERE qr_code = {placeholder} LIMIT 1{lock_clause}"
+        cursor.execute(sql, (asset_id,))
         row = cursor.fetchone()
         return None if row is None else tuple(row)
 
     def _resolve_user_row(self, cursor: Any, user_id: str) -> tuple[Any, ...] | None:
         placeholder = self._placeholder
-        sql = (
-            "SELECT user_id, user_name, student_id "
-            f"FROM users WHERE student_id = {placeholder} OR {self._int_as_text_expr('user_id')} = {placeholder} "
-            f"ORDER BY CASE WHEN student_id = {placeholder} THEN 0 ELSE 1 END LIMIT 1"
-        )
-        cursor.execute(sql, (user_id, user_id, user_id))
+        sql = f"SELECT user_id, user_name, student_id FROM users WHERE student_id = {placeholder} LIMIT 1"
+        cursor.execute(sql, (user_id,))
         row = cursor.fetchone()
         return None if row is None else tuple(row)
 
@@ -493,14 +755,99 @@ class SqlTransactionRepository:
             applicant_user_id=str(values[2]),
             applicant_user_name=str(values[3]),
             reason=values[4],
-            status=BorrowRequestStatus(str(values[5])),
-            reviewer_user_id=values[6],
-            reviewer_user_name=values[7],
-            review_comment=values[8],
-            requested_at=values[9],
-            reviewed_at=values[10],
-            consumed_at=values[11],
+            requested_days=int(values[5]),
+            status=BorrowRequestStatus(str(values[6])),
+            reviewer_user_id=values[7],
+            reviewer_user_name=values[8],
+            review_comment=values[9],
+            requested_at=values[10],
+            reviewed_at=values[11],
+            consumed_at=values[12],
         )
+
+    def _return_acceptance_tuple_to_record(self, row: Any) -> ReturnAcceptanceRecord:
+        values = tuple(row)
+        return ReturnAcceptanceRecord(
+            id=int(values[0]),
+            asset_id=str(values[1]),
+            acceptance_result=AcceptanceResult(str(values[2])),
+            note=values[3],
+            accepted_by_user_id=str(values[4]),
+            accepted_by_user_name=str(values[5]),
+            accepted_at=str(values[6]),
+            related_return_request_seq=self._coerce_optional_int(values[7]),
+            related_return_request_id=values[8],
+            related_return_hw_seq=self._coerce_optional_int(values[9]),
+        )
+
+    def _operation_row_to_trace_record(
+        self,
+        cursor: Any,
+        asset_row: tuple[Any, ...],
+        row: Any,
+    ) -> OperationTraceRecord | None:
+        columns = [str(column[0]) for column in (cursor.description or ())]
+        row_dict = dict(zip(columns, tuple(row)))
+        action_type_raw = str(row_dict.get("op_type") or "").strip()
+        if not action_type_raw:
+            return None
+
+        try:
+            action_type = ActionType(action_type_raw)
+        except ValueError:
+            LOGGER.warning("unsupported operation_records.op_type for trace lookup: %s", action_type_raw)
+            return None
+
+        db_user_id = row_dict.get("user_id")
+        user_id = ""
+        user_name = str(row_dict.get("user_name") or "")
+        if db_user_id is not None:
+            user_row = self._resolve_user_row_by_db_id(cursor, int(db_user_id))
+            if user_row is not None:
+                user_id = self._business_user_id_from_row(user_row)
+                user_name = str(user_row[1] or user_name)
+
+        return OperationTraceRecord(
+            asset_id=self._business_asset_id_from_row(asset_row),
+            action_type=action_type,
+            user_id=user_id,
+            user_name=user_name,
+            op_time=None if row_dict.get("op_time") is None else str(row_dict.get("op_time")),
+            request_seq=self._coerce_optional_int(row_dict.get("request_seq")),
+            request_id=None if row_dict.get("request_id") is None else str(row_dict.get("request_id")),
+            hw_seq=self._coerce_optional_int(row_dict.get("hw_seq")),
+            hw_result=None if row_dict.get("hw_result") is None else str(row_dict.get("hw_result")),
+            hw_sn=None if row_dict.get("hw_sn") is None else str(row_dict.get("hw_sn")),
+        )
+
+    def _resolve_user_row_by_db_id(self, cursor: Any, db_user_id: int) -> tuple[Any, ...] | None:
+        placeholder = self._placeholder
+        cursor.execute(
+            f"SELECT user_id, user_name, student_id FROM users WHERE user_id = {placeholder} LIMIT 1",
+            (db_user_id,),
+        )
+        row = cursor.fetchone()
+        return None if row is None else tuple(row)
+
+    @staticmethod
+    def _business_asset_id_from_row(asset_row: tuple[Any, ...]) -> str:
+        return "" if asset_row[2] is None else str(asset_row[2])
+
+    @staticmethod
+    def _business_user_id_from_row(user_row: tuple[Any, ...]) -> str:
+        return "" if user_row[2] is None else str(user_row[2])
+
+    def _count_resolvable_business_users(self, cursor: Any) -> int:
+        cursor.execute("SELECT COUNT(*) FROM users WHERE student_id IS NOT NULL AND TRIM(student_id) <> ''")
+        row = cursor.fetchone()
+        return 0 if row is None else int(tuple(row)[0] or 0)
+
+    def _find_missing_business_user_ids(self, cursor: Any, user_ids: list[str]) -> list[str]:
+        missing: list[str] = []
+        for user_id in user_ids:
+            if self._resolve_user_row(cursor, user_id) is None:
+                missing.append(user_id)
+        return missing
 
     def _validate_borrow_request_for_consume(self, cursor: Any, record: OperationRecordInput) -> BorrowRequestRecord:
         if record.borrow_request_id is None:
@@ -541,7 +888,7 @@ class SqlTransactionRepository:
 
     def _insert_inbound_asset(self, cursor: Any, commit: InboundCommitInput) -> int:
         columns = set(self._get_table_columns(cursor, "assets"))
-        required_columns = {"asset_name", "qr_code", "status", "location"}
+        required_columns = set(REQUIRED_INBOUND_ASSET_COLUMNS) - {"id"}
         missing_columns = sorted(required_columns - columns)
         if missing_columns:
             raise RuntimeError(f"assets table missing required columns: {', '.join(missing_columns)}")
@@ -601,6 +948,13 @@ class SqlTransactionRepository:
         include_operation_id: bool,
     ) -> dict[str, Any]:
         columns = set(self._get_table_columns(cursor, "operation_records"))
+        missing_trace_columns = [
+            column for column in REQUIRED_OPERATION_RECORD_TRACE_COLUMNS if column not in columns
+        ]
+        if missing_trace_columns:
+            raise RuntimeError(
+                "operation_records table missing required trace columns: " + ", ".join(missing_trace_columns)
+            )
         op_time = getattr(record, "op_time", None) or datetime.now().isoformat(sep=" ", timespec="seconds")
         row: dict[str, Any] = {}
 
@@ -668,6 +1022,12 @@ class SqlTransactionRepository:
             raise ValueError(f"unsupported asset status code: {status_code}")
         return DB_STATUS_TO_ASSET[int(status_code)]
 
+    @staticmethod
+    def _coerce_optional_int(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        return int(value)
+
     def _list_table_names(self, cursor: Any) -> list[str]:
         raise NotImplementedError
 
@@ -685,12 +1045,28 @@ class SqlTransactionRepository:
                 self._create_borrow_requests_table_sqlite(cursor)
             else:
                 self._create_borrow_requests_table_mysql(cursor)
+            self._ensure_borrow_requests_requested_days_column(cursor)
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    def _ensure_borrow_requests_requested_days_column(self, cursor: Any) -> None:
+        columns = set(self._get_table_columns(cursor, "borrow_requests"))
+        if "requested_days" in columns:
+            return
+        if self._backend_name == "sqlite":
+            cursor.execute(
+                f"ALTER TABLE borrow_requests ADD COLUMN requested_days INTEGER NOT NULL DEFAULT {DEFAULT_MAX_BORROW_DAYS}"
+            )
+        else:
+            cursor.execute(
+                "ALTER TABLE borrow_requests "
+                f"ADD COLUMN requested_days INT NOT NULL DEFAULT {DEFAULT_MAX_BORROW_DAYS} AFTER reason"
+            )
+        self._table_columns_cache.pop("borrow_requests", None)
 
     def _create_borrow_requests_table_sqlite(self, cursor: Any) -> None:
         cursor.executescript(
@@ -702,6 +1078,7 @@ class SqlTransactionRepository:
                 applicant_user_id TEXT NOT NULL,
                 applicant_user_name TEXT NOT NULL,
                 reason TEXT,
+                requested_days INTEGER NOT NULL DEFAULT 30,
                 status TEXT NOT NULL,
                 reviewer_user_id TEXT,
                 reviewer_user_name TEXT,
@@ -728,6 +1105,7 @@ class SqlTransactionRepository:
                 applicant_user_id VARCHAR(64) NOT NULL,
                 applicant_user_name VARCHAR(128) NOT NULL,
                 reason TEXT NULL,
+                requested_days INT NOT NULL DEFAULT 30,
                 status VARCHAR(32) NOT NULL,
                 reviewer_user_id VARCHAR(64) NULL,
                 reviewer_user_name VARCHAR(128) NULL,
@@ -738,6 +1116,70 @@ class SqlTransactionRepository:
                 INDEX idx_borrow_requests_status (status),
                 INDEX idx_borrow_requests_asset_id (asset_id),
                 INDEX idx_borrow_requests_applicant_user_id (applicant_user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+
+    def _ensure_return_acceptance_records_table(self) -> None:
+        connection = self._connect()
+        try:
+            cursor = connection.cursor()
+            if self._backend_name == "sqlite":
+                self._create_return_acceptance_records_table_sqlite(cursor)
+            else:
+                self._create_return_acceptance_records_table_mysql(cursor)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _create_return_acceptance_records_table_sqlite(self, cursor: Any) -> None:
+        cursor.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS return_acceptance_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asset_id TEXT NOT NULL,
+                acceptance_result TEXT NOT NULL,
+                note TEXT,
+                accepted_by_user_id TEXT NOT NULL,
+                accepted_by_user_name TEXT NOT NULL,
+                accepted_at TEXT NOT NULL,
+                related_return_request_seq INTEGER,
+                related_return_request_id TEXT,
+                related_return_hw_seq INTEGER NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_return_acceptance_asset_hw_seq
+                ON return_acceptance_records(asset_id, related_return_hw_seq);
+            CREATE INDEX IF NOT EXISTS idx_return_acceptance_result
+                ON return_acceptance_records(acceptance_result);
+            CREATE INDEX IF NOT EXISTS idx_return_acceptance_user
+                ON return_acceptance_records(accepted_by_user_id);
+            CREATE INDEX IF NOT EXISTS idx_return_acceptance_time
+                ON return_acceptance_records(accepted_at);
+            """
+        )
+
+    def _create_return_acceptance_records_table_mysql(self, cursor: Any) -> None:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS return_acceptance_records (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                asset_id VARCHAR(64) NOT NULL,
+                acceptance_result VARCHAR(32) NOT NULL,
+                note TEXT NULL,
+                accepted_by_user_id VARCHAR(64) NOT NULL,
+                accepted_by_user_name VARCHAR(128) NOT NULL,
+                accepted_at VARCHAR(32) NOT NULL,
+                related_return_request_seq BIGINT NULL,
+                related_return_request_id VARCHAR(64) NULL,
+                related_return_hw_seq BIGINT NOT NULL,
+                UNIQUE KEY uq_return_acceptance_asset_hw_seq (asset_id, related_return_hw_seq),
+                INDEX idx_return_acceptance_result (acceptance_result),
+                INDEX idx_return_acceptance_user (accepted_by_user_id),
+                INDEX idx_return_acceptance_time (accepted_at)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
@@ -764,6 +1206,7 @@ class SQLiteTransactionRepository(SqlTransactionRepository):
         )
         self.database_path = str(path)
         self._ensure_borrow_requests_table()
+        self._ensure_return_acceptance_records_table()
 
     def _list_table_names(self, cursor: Any) -> list[str]:
         cursor.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -813,6 +1256,7 @@ class MySQLTransactionRepository(SqlTransactionRepository):
         self._operation_record_lock_name = f"{config.database}.operation_records.op_id"
         self._operation_record_lock_timeout_seconds = int(os.getenv("BACKEND_DB_OP_ID_LOCK_TIMEOUT", "5"))
         self._ensure_borrow_requests_table()
+        self._ensure_return_acceptance_records_table()
 
     @classmethod
     def from_env(cls) -> MySQLTransactionRepository:

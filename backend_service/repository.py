@@ -8,13 +8,17 @@ from typing import Any, Protocol
 
 from asset_lifecycle import next_asset_status_for_action, validate_asset_transition
 from models import (
+    AcceptanceResult,
     AssetStatus,
     BorrowRequestCreateInput,
     BorrowRequestRecord,
     BorrowRequestReviewInput,
     BorrowRequestStatus,
     InboundCommitInput,
+    OperationTraceRecord,
     OperationRecordInput,
+    ReturnAcceptanceCreateInput,
+    ReturnAcceptanceRecord,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -45,6 +49,26 @@ class TransactionRepository(Protocol):
 
     def review_borrow_request(self, review: BorrowRequestReviewInput) -> BorrowRequestRecord: ...
 
+    def get_latest_operation_record(self, asset_id: str) -> OperationTraceRecord | None: ...
+
+    def create_return_acceptance(self, record: ReturnAcceptanceCreateInput) -> ReturnAcceptanceRecord: ...
+
+    def list_return_acceptances(
+        self,
+        *,
+        asset_id: str | None = None,
+        acceptance_result: AcceptanceResult | None = None,
+        accepted_by_user_id: str | None = None,
+    ) -> list[ReturnAcceptanceRecord]: ...
+
+    def get_return_acceptance_by_related_return(
+        self,
+        *,
+        asset_id: str,
+        related_return_request_seq: int | None,
+        related_return_hw_seq: int | None,
+    ) -> ReturnAcceptanceRecord | None: ...
+
     def rollback_transaction(self, asset_id: str, reason: str) -> None: ...
 
 
@@ -65,6 +89,7 @@ class InMemoryTransactionRepository:
         initial_categories: dict[int, str] | None = None,
         initial_asset_details: dict[str, dict[str, Any]] | None = None,
         initial_borrow_requests: list[BorrowRequestRecord] | None = None,
+        initial_return_acceptances: list[ReturnAcceptanceRecord] | None = None,
     ) -> None:
         self.assets: dict[str, AssetStatus] = dict(initial_assets or {})
         self.categories: dict[int, str] = dict(initial_categories or DEFAULT_INMEMORY_CATEGORIES)
@@ -75,6 +100,12 @@ class InMemoryTransactionRepository:
         self.borrow_requests: dict[str, BorrowRequestRecord] = {
             record.request_id: self._clone_borrow_request(record) for record in (initial_borrow_requests or [])
         }
+        self.return_acceptance_records: list[ReturnAcceptanceRecord] = [
+            self._clone_return_acceptance(record) for record in (initial_return_acceptances or [])
+        ]
+        self._next_return_acceptance_id = (
+            max((record.id for record in self.return_acceptance_records), default=0) + 1
+        )
         self._lock = threading.Lock()
         self._snapshots: dict[str, dict[str, Any]] = {}
 
@@ -94,6 +125,7 @@ class InMemoryTransactionRepository:
                 applicant_user_id=request.applicant_user_id,
                 applicant_user_name=request.applicant_user_name,
                 reason=request.reason,
+                requested_days=request.requested_days,
                 status=request.status,
                 requested_at=request.requested_at,
             )
@@ -145,6 +177,90 @@ class InMemoryTransactionRepository:
             )
             self.borrow_requests[review.request_id] = updated
             return self._clone_borrow_request(updated)
+
+    def get_latest_operation_record(self, asset_id: str) -> OperationTraceRecord | None:
+        with self._lock:
+            records = list(self.records)
+
+        for record in reversed(records):
+            if record.asset_id != asset_id:
+                continue
+            return OperationTraceRecord(
+                asset_id=record.asset_id,
+                action_type=record.action_type,
+                user_id=record.user_id,
+                user_name=record.user_name,
+                op_time=getattr(record, "op_time", None),
+                request_seq=record.request_seq,
+                request_id=record.request_id,
+                hw_seq=record.hw_seq,
+                hw_result=record.hw_result,
+                hw_sn=record.hw_sn,
+            )
+        return None
+
+    def create_return_acceptance(self, record: ReturnAcceptanceCreateInput) -> ReturnAcceptanceRecord:
+        with self._lock:
+            duplicate = self._find_return_acceptance_locked(
+                asset_id=record.asset_id,
+                related_return_request_seq=record.related_return_request_seq,
+                related_return_hw_seq=record.related_return_hw_seq,
+            )
+            if duplicate is not None:
+                raise ValueError("璇ユ褰掕繕缁撴灉宸插畬鎴愰獙鏀讹紝涓嶈兘閲嶅鎻愪氦")
+
+            created = ReturnAcceptanceRecord(
+                id=self._next_return_acceptance_id,
+                asset_id=record.asset_id,
+                acceptance_result=record.acceptance_result,
+                note=record.note,
+                accepted_by_user_id=record.accepted_by_user_id,
+                accepted_by_user_name=record.accepted_by_user_name,
+                accepted_at=record.accepted_at,
+                related_return_request_seq=record.related_return_request_seq,
+                related_return_request_id=record.related_return_request_id,
+                related_return_hw_seq=record.related_return_hw_seq,
+            )
+            self.return_acceptance_records.append(created)
+            self._next_return_acceptance_id += 1
+            return self._clone_return_acceptance(created)
+
+    def list_return_acceptances(
+        self,
+        *,
+        asset_id: str | None = None,
+        acceptance_result: AcceptanceResult | None = None,
+        accepted_by_user_id: str | None = None,
+    ) -> list[ReturnAcceptanceRecord]:
+        with self._lock:
+            items = list(self.return_acceptance_records)
+
+        filtered: list[ReturnAcceptanceRecord] = []
+        for item in items:
+            if asset_id and item.asset_id != asset_id:
+                continue
+            if acceptance_result is not None and item.acceptance_result != acceptance_result:
+                continue
+            if accepted_by_user_id and item.accepted_by_user_id != accepted_by_user_id:
+                continue
+            filtered.append(self._clone_return_acceptance(item))
+
+        return sorted(filtered, key=lambda item: (item.accepted_at, item.id), reverse=True)
+
+    def get_return_acceptance_by_related_return(
+        self,
+        *,
+        asset_id: str,
+        related_return_request_seq: int | None,
+        related_return_hw_seq: int | None,
+    ) -> ReturnAcceptanceRecord | None:
+        with self._lock:
+            record = self._find_return_acceptance_locked(
+                asset_id=asset_id,
+                related_return_request_seq=related_return_request_seq,
+                related_return_hw_seq=related_return_hw_seq,
+            )
+            return None if record is None else self._clone_return_acceptance(record)
 
     def apply_operation_atomically(self, record: OperationRecordInput) -> AssetStatus:
         with self._lock:
@@ -264,6 +380,26 @@ class InMemoryTransactionRepository:
 
         return True
 
+    def _find_return_acceptance_locked(
+        self,
+        *,
+        asset_id: str,
+        related_return_request_seq: int | None,
+        related_return_hw_seq: int | None,
+    ) -> ReturnAcceptanceRecord | None:
+        for record in self.return_acceptance_records:
+            if record.asset_id != asset_id:
+                continue
+            if related_return_hw_seq is not None and record.related_return_hw_seq != related_return_hw_seq:
+                continue
+            if (
+                related_return_request_seq is not None
+                and record.related_return_request_seq != related_return_request_seq
+            ):
+                continue
+            return record
+        return None
+
     def _validate_borrow_request_for_consume_locked(self, request_id: str, record: OperationRecordInput) -> None:
         borrow_request = self.borrow_requests.get(request_id)
         if borrow_request is None:
@@ -281,6 +417,10 @@ class InMemoryTransactionRepository:
 
     @staticmethod
     def _clone_borrow_request(record: BorrowRequestRecord) -> BorrowRequestRecord:
+        return replace(record)
+
+    @staticmethod
+    def _clone_return_acceptance(record: ReturnAcceptanceRecord) -> ReturnAcceptanceRecord:
         return replace(record)
 
     @staticmethod

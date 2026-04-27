@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable
 
 import runtime_paths  # noqa: F401
 from models import (
+    AcceptanceResult,
     ActionType,
     AssetStatus,
     BorrowApprovalCommand,
@@ -19,13 +20,18 @@ from models import (
     BorrowRequestStatus,
     BusinessResult,
     ConfirmResult,
+    DEFAULT_MAX_BORROW_DAYS,
     DeviceStatus,
     InboundCommand,
     InboundCommitInput,
     InboundRuleCheckRequest,
     OperationRecordInput,
     PendingTransaction,
+    RoleType,
     ReturnCommand,
+    ReturnAcceptanceActionResult,
+    ReturnAcceptanceCreateCommand,
+    ReturnAcceptanceCreateInput,
     RuleCheckRequest,
     TransactionState,
 )
@@ -36,15 +42,38 @@ from serial_manager import SendResult, SerialManager
 from transaction_manager import BusyTransactionError, TransactionManager
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_INBOUND_ADMIN_USER_IDS = ("ADMIN", "U-ADMIN")
+DEFAULT_ADMIN_USER_IDS = ("ADMIN", "U-ADMIN")
 
 
-def _load_inbound_admin_user_ids() -> set[str]:
-    raw = os.getenv("BACKEND_INBOUND_ADMIN_USER_IDS") or os.getenv("BACKEND_ADMIN_USER_IDS") or ""
+def _load_admin_user_ids() -> set[str]:
+    raw = os.getenv("BACKEND_ADMIN_USER_IDS") or os.getenv("BACKEND_INBOUND_ADMIN_USER_IDS") or ""
     configured = {item.strip() for item in raw.split(",") if item.strip()}
     if configured:
         return configured
-    return set(DEFAULT_INBOUND_ADMIN_USER_IDS)
+    return set(DEFAULT_ADMIN_USER_IDS)
+
+
+def _load_max_borrow_days() -> int:
+    raw = (os.getenv("BACKEND_MAX_BORROW_DAYS") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_BORROW_DAYS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        LOGGER.warning(
+            "invalid BACKEND_MAX_BORROW_DAYS=%s, fallback to default=%s",
+            raw,
+            DEFAULT_MAX_BORROW_DAYS,
+        )
+        return DEFAULT_MAX_BORROW_DAYS
+    if parsed <= 0:
+        LOGGER.warning(
+            "non-positive BACKEND_MAX_BORROW_DAYS=%s, fallback to default=%s",
+            raw,
+            DEFAULT_MAX_BORROW_DAYS,
+        )
+        return DEFAULT_MAX_BORROW_DAYS
+    return parsed
 
 
 class AssetConfirmService:
@@ -71,9 +100,10 @@ class AssetConfirmService:
         self.transaction_manager = transaction_manager or TransactionManager()
         self._status_callback = status_callback
         self._device_status = DeviceStatus.UNKNOWN
-        self._inbound_admin_user_ids = {
-            user_id.strip() for user_id in (inbound_admin_user_ids or _load_inbound_admin_user_ids()) if user_id.strip()
+        self._admin_user_ids = {
+            user_id.strip() for user_id in (inbound_admin_user_ids or _load_admin_user_ids()) if user_id.strip()
         }
+        self._max_borrow_days = _load_max_borrow_days()
 
         self.serial_manager.set_frame_handler(self._on_frame)
         self.serial_manager.set_status_handler(self._on_status_changed)
@@ -112,6 +142,97 @@ class AssetConfirmService:
     def request_inbound(self, command: InboundCommand) -> BusinessResult:
         return self._request_inbound(command)
 
+    def create_return_acceptance(self, command: ReturnAcceptanceCreateCommand) -> ReturnAcceptanceActionResult:
+        if not self._is_admin(command.accepted_by_user_id):
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.PERMISSION_DENIED.value,
+                message="admin permission is required for return acceptance",
+            )
+
+        current_status = self.get_asset_status(command.asset_id)
+        if current_status is None:
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.ASSET_NOT_FOUND.value,
+                message="asset not found, cannot create return acceptance",
+            )
+
+        if current_status == AssetStatus.BORROWED:
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.STATE_INVALID.value,
+                message="asset is still borrowed, return acceptance is not allowed",
+            )
+
+        latest_operation = self.repository.get_latest_operation_record(command.asset_id)
+        if latest_operation is None or latest_operation.action_type != ActionType.RETURN:
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.STATE_INVALID.value,
+                message="no completed return trace is available for acceptance",
+            )
+
+        if latest_operation.hw_seq is None:
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.INTERNAL_ERROR.value,
+                message="latest return trace is missing hw_seq",
+            )
+
+        existing = self.repository.get_return_acceptance_by_related_return(
+            asset_id=command.asset_id,
+            related_return_request_seq=latest_operation.request_seq,
+            related_return_hw_seq=latest_operation.hw_seq,
+        )
+        if existing is not None:
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.STATE_INVALID.value,
+                message="the latest return has already been accepted",
+                item=existing,
+            )
+
+        accepted_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+        create_input = ReturnAcceptanceCreateInput(
+            asset_id=command.asset_id,
+            acceptance_result=command.acceptance_result,
+            note=command.note,
+            accepted_by_user_id=command.accepted_by_user_id,
+            accepted_by_user_name=command.accepted_by_user_name,
+            accepted_at=accepted_at,
+            related_return_request_seq=latest_operation.request_seq,
+            related_return_request_id=latest_operation.request_id,
+            related_return_hw_seq=latest_operation.hw_seq,
+        )
+
+        try:
+            record = self.repository.create_return_acceptance(create_input)
+        except ValueError as exc:
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.STATE_INVALID.value,
+                message=str(exc),
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "create return acceptance failed: asset_id=%s related_return_hw_seq=%s",
+                command.asset_id,
+                latest_operation.hw_seq,
+            )
+            return ReturnAcceptanceActionResult(
+                success=False,
+                code=ConfirmResult.INTERNAL_ERROR.value,
+                message=f"failed to persist return acceptance: {exc}",
+            )
+
+        return ReturnAcceptanceActionResult(
+            success=True,
+            code="ACCEPTANCE_CREATED",
+            message="return acceptance record created",
+            item=record,
+        )
+
     def create_borrow_request(self, command: BorrowRequestCreateCommand) -> BorrowRequestActionResult:
         current_status = self.get_asset_status(command.asset_id)
         if current_status is None:
@@ -133,6 +254,27 @@ class AssetConfirmService:
                 success=False,
                 code=ConfirmResult.BUSY.value,
                 message="该资产已有待确认事务，请勿重复提交",
+            )
+
+        requested_days = command.requested_days or self._max_borrow_days
+        requested_days_check = self.rule_service.validate_requested_days(
+            request=RuleCheckRequest(
+                asset_id=command.asset_id,
+                user_id=command.user_id,
+                user_name=command.user_name,
+                action_type=ActionType.BORROW,
+                device_status=self.device_status,
+                asset_status=current_status,
+                has_pending_transaction=False,
+            ),
+            requested_days=requested_days,
+            max_borrow_days=self._max_borrow_days,
+        )
+        if not requested_days_check.passed:
+            return BorrowRequestActionResult(
+                success=False,
+                code=requested_days_check.code,
+                message=requested_days_check.message,
             )
 
         pending_items = self.repository.list_borrow_requests(
@@ -158,6 +300,7 @@ class AssetConfirmService:
                 applicant_user_id=command.user_id,
                 applicant_user_name=command.user_name,
                 reason=command.reason,
+                requested_days=requested_days,
                 status=BorrowRequestStatus.PENDING,
                 requested_at=requested_at,
             )
@@ -261,7 +404,7 @@ class AssetConfirmService:
             user_name=record.applicant_user_name,
             action_type=ActionType.BORROW,
             timeout_ms=timeout_ms,
-            extra={"borrow_request_id": record.request_id},
+            extra={"borrow_request_id": record.request_id, "requested_days": record.requested_days},
         )
 
     def request_asset_borrow_confirm(
@@ -316,6 +459,9 @@ class AssetConfirmService:
 
     def get_asset_status(self, asset_id: str) -> AssetStatus | None:
         return self.repository.get_asset_status(asset_id)
+
+    def resolve_user_role(self, user_id: str) -> RoleType:
+        return self.rule_service.resolve_user_role(user_id, admin_user_ids=self._admin_user_ids)
 
     def _request_action(
         self,
@@ -430,6 +576,10 @@ class AssetConfirmService:
             self.transaction_manager.remove_transaction(asset_id)
 
     def _request_inbound(self, command: InboundCommand) -> BusinessResult:
+        repository_preflight_failure = self._check_inbound_repository_preflight(command)
+        if repository_preflight_failure is not None:
+            return self._return_with_status(repository_preflight_failure)
+
         rule_request = InboundRuleCheckRequest(
             asset_id=command.asset_id,
             user_id=command.user_id,
@@ -546,13 +696,69 @@ class AssetConfirmService:
         finally:
             self.transaction_manager.remove_transaction(command.asset_id)
 
+    def _check_inbound_repository_preflight(self, command: InboundCommand) -> BusinessResult | None:
+        probe_method = getattr(self.repository, "probe", None)
+        if not callable(probe_method):
+            return None
+
+        try:
+            probe = probe_method(inbound_admin_user_ids=set(self._admin_user_ids))
+        except TypeError:
+            probe = probe_method()
+        except Exception as exc:
+            LOGGER.exception("business inbound repository preflight failed: asset_id=%s user_id=%s", command.asset_id, command.user_id)
+            return self._build_result(
+                success=False,
+                code=ConfirmResult.INTERNAL_ERROR.value,
+                message=f"sql inbound preflight failed: {exc}",
+                asset_id=command.asset_id,
+                action_type=ActionType.INBOUND,
+                user_id=command.user_id,
+                user_name=command.user_name,
+                seq_id=-1,
+                request_seq=None,
+                request_id=None,
+                state=TransactionState.FAILED,
+                extra={},
+            )
+
+        if probe.ready:
+            return None
+
+        errors = list(getattr(probe, "errors", []) or [])
+        message = "sql inbound preflight failed"
+        if errors:
+            message = f"{message}: {'; '.join(errors)}"
+
+        return self._build_result(
+            success=False,
+            code=ConfirmResult.INTERNAL_ERROR.value,
+            message=message,
+            asset_id=command.asset_id,
+            action_type=ActionType.INBOUND,
+            user_id=command.user_id,
+            user_name=command.user_name,
+            seq_id=-1,
+            request_seq=None,
+            request_id=None,
+            state=TransactionState.FAILED,
+            extra={
+                "repository_backend": getattr(probe, "backend", None),
+                "repository_status": getattr(probe, "status", None),
+                "repository_errors": errors,
+            },
+        )
+
     def _on_frame(self, frame: Frame) -> None:
         self.transaction_manager.handle_frame(frame)
 
     def _on_status_changed(self, status: DeviceStatus) -> None:
         self._device_status = status
         if status == DeviceStatus.OFFLINE:
-            LOGGER.warning("service observed device offline")
+            if self.serial_manager.is_open:
+                LOGGER.warning("service observed device offline")
+            else:
+                LOGGER.info("service shutdown completed with device offline")
             self._publish_device_status(status)
 
     def _finalize_inbound_transaction(self, tx: PendingTransaction) -> BusinessResult:
@@ -735,6 +941,7 @@ class AssetConfirmService:
                 extra=self._merge_result_extra(tx.extra, {"asset_status": current_status.value}),
             )
 
+        due_time = self._calculate_due_time(tx)
         record = OperationRecordInput(
             asset_id=tx.asset_id,
             user_id=tx.user_id,
@@ -745,7 +952,7 @@ class AssetConfirmService:
             hw_seq=tx.hw_seq,
             hw_result=hw_result,
             hw_sn=tx.hw_sn,
-            due_time=None,
+            due_time=due_time,
             borrow_request_id=str(tx.extra.get("borrow_request_id")) if tx.extra.get("borrow_request_id") else None,
         )
 
@@ -840,7 +1047,13 @@ class AssetConfirmService:
             hw_result=hw_result,
             hw_sn=tx.hw_sn,
             state=tx.state,
-            extra=self._merge_result_extra(tx.extra, {"asset_status": new_status.value}),
+            extra=self._merge_result_extra(
+                tx.extra,
+                {
+                    "asset_status": new_status.value,
+                    "due_time": due_time,
+                },
+            ),
         )
 
     def _result_from_runtime_failure(self, tx: PendingTransaction) -> BusinessResult:
@@ -955,6 +1168,30 @@ class AssetConfirmService:
             ),
         )
 
+    def _calculate_due_time(self, tx: PendingTransaction) -> str | None:
+        if tx.action_type != ActionType.BORROW:
+            return None
+        requested_days = tx.extra.get("requested_days")
+        if requested_days is None:
+            return None
+        try:
+            borrow_days = int(requested_days)
+        except (TypeError, ValueError):
+            LOGGER.warning(
+                "invalid requested_days in transaction extra: asset_id=%s requested_days=%s",
+                tx.asset_id,
+                requested_days,
+            )
+            return None
+        if borrow_days <= 0:
+            LOGGER.warning(
+                "non-positive requested_days in transaction extra: asset_id=%s requested_days=%s",
+                tx.asset_id,
+                requested_days,
+            )
+            return None
+        return (datetime.now() + timedelta(days=borrow_days)).isoformat(sep=" ", timespec="seconds")
+
     def _current_asset_status_extra(self, asset_id: str) -> dict[str, str]:
         asset_status = self.get_asset_status(asset_id)
         if asset_status is None:
@@ -974,7 +1211,7 @@ class AssetConfirmService:
         return merged
 
     def _is_admin(self, user_id: str) -> bool:
-        return user_id.strip() in self._inbound_admin_user_ids
+        return self.resolve_user_role(user_id) == RoleType.ADMIN
 
     def _is_inbound_admin(self, user_id: str) -> bool:
         return self._is_admin(user_id)

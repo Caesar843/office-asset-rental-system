@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from api_app import ApiRuntime, build_default_runtime, build_status_callback, create_app
 from db_repository import SQLiteTransactionRepository
-from models import ActionType, AssetStatus, ConfirmResult, DeviceStatus, OperationRecordInput
+from models import AcceptanceResult, ActionType, AssetStatus, ConfirmResult, DeviceStatus, OperationRecordInput
 from mock_mcu import MockMCUServer
 from protocol import Frame, MsgType
 from repository import InMemoryTransactionRepository
@@ -160,6 +160,36 @@ class ApiAppTests(unittest.TestCase):
             },
         )
 
+    def mark_mysql_repository_unavailable(
+        self,
+        runtime: ApiRuntime,
+        *,
+        repository_mode: str = "inmemory",
+        repository_fallback: bool = True,
+        repository_ready: bool = False,
+        repository_status: str = "error",
+        startup_error: str = "mysql repository unavailable: dependency missing",
+    ) -> ApiRuntime:
+        runtime.requested_repository_mode = "mysql"
+        runtime.repository_mode = repository_mode
+        runtime.repository_fallback = repository_fallback
+        runtime.repository_ready = repository_ready
+        runtime.repository_status = repository_status
+        runtime.repository_details = {
+            "backend": repository_mode,
+            "ready": repository_ready,
+            "status": repository_status,
+            "warnings": [],
+            "errors": [startup_error],
+            "details": {
+                "requested_mode": "mysql",
+                "fallback_target": repository_mode,
+                "write_blocked": True,
+            },
+        }
+        runtime.startup_error = startup_error
+        return runtime
+
     def build_event_frame(
         self,
         payload: dict[str, object],
@@ -228,24 +258,12 @@ class ApiAppTests(unittest.TestCase):
         self.assertEqual(payload["serial_details"]["diagnosis"], "connected")
 
     def test_health_exposes_repository_fallback_metadata(self) -> None:
-        runtime = self.build_runtime(
-            serial_manager=FakeSerialManager(),
-            initial_assets={"AS-1001": AssetStatus.IN_STOCK},
+        runtime = self.mark_mysql_repository_unavailable(
+            self.build_runtime(
+                serial_manager=FakeSerialManager(),
+                initial_assets={"AS-1001": AssetStatus.IN_STOCK},
+            )
         )
-        runtime.requested_repository_mode = "mysql"
-        runtime.repository_mode = "inmemory"
-        runtime.repository_fallback = True
-        runtime.repository_ready = True
-        runtime.repository_status = "fallback"
-        runtime.repository_details = {
-            "backend": "inmemory",
-            "ready": True,
-            "status": "warning",
-            "warnings": ["mysql repository unavailable, fallback to in-memory"],
-            "errors": [],
-            "details": {"requested_mode": "mysql", "fallback_target": "inmemory"},
-        }
-        runtime.startup_error = "mysql repository unavailable, fallback to in-memory"
         app = create_app(runtime)
 
         with TestClient(app) as client:
@@ -257,8 +275,106 @@ class ApiAppTests(unittest.TestCase):
         self.assertEqual(payload["requested_repository_mode"], "mysql")
         self.assertEqual(payload["repository_mode"], "inmemory")
         self.assertTrue(payload["repository_fallback"])
-        self.assertEqual(payload["repository_status"], "fallback")
-        self.assertIn("fallback to in-memory", payload["startup_error"])
+        self.assertFalse(payload["repository_ready"])
+        self.assertEqual(payload["repository_status"], "error")
+        self.assertTrue(payload["repository_details"]["details"]["write_blocked"])
+        self.assertIn("mysql repository unavailable", payload["startup_error"])
+
+    def test_mysql_unavailable_write_endpoints_are_rejected_with_503(self) -> None:
+        runtime = self.mark_mysql_repository_unavailable(
+            self.build_runtime(
+                serial_manager=FakeSerialManager(),
+                initial_assets={"AS-MY-1001": AssetStatus.IN_STOCK},
+            ),
+            startup_error="mysql repository unavailable: connection refused",
+        )
+        app = create_app(runtime)
+
+        request_cases = [
+            ("post", "/borrow-requests", {"asset_id": "AS-MY-1001", "user_id": "U-1001", "user_name": "Borrow User"}),
+            (
+                "post",
+                "/borrow-requests/req-mysql/approve",
+                {"reviewer_user_id": "U-ADMIN", "reviewer_user_name": "Admin", "review_comment": "ok"},
+            ),
+            (
+                "post",
+                "/borrow-requests/req-mysql/start-borrow",
+                {"timeout_ms": 100},
+            ),
+            (
+                "post",
+                "/return-acceptances",
+                {
+                    "asset_id": "AS-MY-1001",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.NORMAL.value,
+                    "note": "checked",
+                },
+            ),
+            (
+                "post",
+                "/transactions/borrow",
+                {"asset_id": "AS-MY-1001", "user_id": "U-1001", "user_name": "Borrow User", "timeout_ms": 100},
+            ),
+            (
+                "post",
+                "/transactions/return",
+                {"asset_id": "AS-MY-1001", "user_id": "U-1001", "user_name": "Borrow User", "timeout_ms": 100},
+            ),
+            (
+                "post",
+                "/transactions/inbound",
+                {
+                    "asset_id": "AS-MY-2001",
+                    "user_id": "U-ADMIN",
+                    "user_name": "Admin",
+                    "asset_name": "New Asset",
+                    "category_id": 1,
+                    "location": "Shelf A",
+                    "timeout_ms": 100,
+                },
+            ),
+        ]
+
+        with TestClient(app) as client:
+            for method, path, payload in request_cases:
+                response = getattr(client, method)(path, json=payload)
+                self.assertEqual(response.status_code, 503, path)
+                self.assertIn("requested mysql repository is not ready for formal writes", response.json()["detail"])
+                self.assertIn("connection refused", response.json()["detail"])
+
+    def test_mysql_requested_and_probe_not_ready_blocks_writes_without_fallback(self) -> None:
+        runtime = self.mark_mysql_repository_unavailable(
+            self.build_runtime(
+                serial_manager=FakeSerialManager(),
+                initial_assets={"AS-MY-3001": AssetStatus.IN_STOCK},
+            ),
+            repository_mode="mysql",
+            repository_fallback=False,
+            repository_ready=False,
+            repository_status="error",
+            startup_error="mysql repository probe failed: missing tables",
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            health_response = client.get("/health")
+            write_response = client.post(
+                "/transactions/borrow",
+                json={"asset_id": "AS-MY-3001", "user_id": "U-3001", "user_name": "User A", "timeout_ms": 100},
+            )
+
+        self.assertEqual(health_response.status_code, 200)
+        health_payload = health_response.json()
+        self.assertEqual(health_payload["requested_repository_mode"], "mysql")
+        self.assertEqual(health_payload["repository_mode"], "mysql")
+        self.assertFalse(health_payload["repository_fallback"])
+        self.assertFalse(health_payload["repository_ready"])
+        self.assertEqual(health_payload["repository_status"], "error")
+        self.assertEqual(write_response.status_code, 503)
+        self.assertIn("missing tables", write_response.json()["detail"])
 
     def test_health_reports_mock_socket_diagnostics_when_mock_is_missing(self) -> None:
         env = {
@@ -339,7 +455,6 @@ class ApiAppTests(unittest.TestCase):
                 runtime = build_default_runtime()
                 app = create_app(runtime)
                 with TestClient(app) as client:
-                    time.sleep(0.2)
                     health = client.get("/health").json()
                     with client.websocket_connect("/ws/status") as websocket:
                         response = client.post(
@@ -347,18 +462,22 @@ class ApiAppTests(unittest.TestCase):
                             json={"asset_id": "AS-1092", "user_id": "U-1092", "user_name": "Demo User", "timeout_ms": 300},
                         )
                         messages = [websocket.receive_json(), websocket.receive_json(), websocket.receive_json()]
+                    post_borrow_health = client.get("/health").json()
         finally:
             mock_server.stop()
 
-        self.assertEqual(health["status"], "ok")
-        self.assertEqual(health["device_status"], DeviceStatus.ONLINE.value)
+        self.assertIn(health["status"], {"warning", "ok"})
+        self.assertIn(health["device_status"], {DeviceStatus.UNKNOWN.value, DeviceStatus.ONLINE.value})
         self.assertTrue(health["serial_open"])
         self.assertEqual(health["serial_details"]["transport"], "socket")
-        self.assertEqual(health["serial_details"]["diagnosis"], "connected")
+        self.assertIn(health["serial_details"]["diagnosis"], {"waiting_for_heartbeat", "connected"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual([message["code"] for message in messages], ["WAITING_ACK", "WAITING_HW", "CONFIRMED"])
         self.assertTrue(response.json()["success"])
         self.assertEqual(response.json()["transaction_state"], "COMPLETED")
+        self.assertEqual(post_borrow_health["status"], "ok")
+        self.assertEqual(post_borrow_health["device_status"], DeviceStatus.ONLINE.value)
+        self.assertEqual(post_borrow_health["serial_details"]["diagnosis"], "connected")
 
     def test_get_asset_returns_actions_and_scan_result_matches_vision_contract(self) -> None:
         runtime = self.build_runtime(
@@ -456,6 +575,87 @@ class ApiAppTests(unittest.TestCase):
             '/borrow-requests',
             '/start-borrow',
             'data-tab="borrow"',
+            'id="borrow-request-days"',
+            'requested_days: requestedDaysRaw ? Number(requestedDaysRaw) : null,',
+            '<strong>借用天数:</strong>',
+        ):
+            self.assertIn(snippet, html)
+
+    def test_frontend_home_borrow_request_uses_result_success_and_requested_days_wiring(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+        for snippet in (
+            'formatApiResultMessage',
+            'const isSuccess = result && result.success === true;',
+            "setStatusText('borrow-status', `${isSuccess ? '借用申请成功' : '借用申请失败'}：${message}`, isSuccess ? 'success' : 'error');",
+            'id="borrow-request-days"',
+        ):
+            self.assertIn(snippet, html)
+
+    def test_frontend_home_contains_return_acceptance_hooks_and_export_entry(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+        for snippet in (
+            'setupReturnAcceptancePage',
+            'data-tab="return-acceptances"',
+            'id="return-acceptance-asset-id"',
+            'id="return-acceptance-result"',
+            'id="return-acceptance-note"',
+            'id="return-acceptance-user-id"',
+            'id="return-acceptance-user-name"',
+            'id="return-acceptances-list"',
+            'submitReturnAcceptance',
+            'loadReturnAcceptances',
+            'downloadFilteredReturnAcceptancesExport',
+            '/return-acceptances',
+            '/export/return-acceptances.csv',
+            'DAMAGED / MISSING_PARTS',
+        ):
+            self.assertIn(snippet, html)
+
+    def test_frontend_home_return_acceptance_uses_result_success_and_readable_error_helpers(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+        for snippet in (
+            'formatApiValidationDetail',
+            'formatApiResultMessage',
+            'const isSuccess = result && result.success === true;',
+            '参数校验失败',
+            "setStatusText('return-acceptance-status', `验收提交失败：${message}`, 'error');",
+        ):
+            self.assertIn(snippet, html)
+
+    def test_frontend_home_contains_overdue_exception_filter_and_dashboard_hook(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        html = response.text
+        for snippet in (
+            '<option value="OVERDUE">OVERDUE</option>',
+            "const exceptionStats = dashboard.exception_stats || {};",
+            "${exceptionStats.overdue_count || 0}",
         ):
             self.assertIn(snippet, html)
 
@@ -477,52 +677,56 @@ class ApiAppTests(unittest.TestCase):
         self.assertEqual(repository.records, [])
 
     def test_borrow_request_api_create_approve_start_and_list_flow(self) -> None:
-        repository = InMemoryTransactionRepository(initial_assets={"AS-BR-1001": AssetStatus.IN_STOCK})
-        runtime = self.build_runtime(
-            serial_manager=FakeSerialManager(
-                response_factory=lambda payload, seq_id: self.build_event_frame(
-                    payload,
-                    confirm_result=ConfirmResult.CONFIRMED.value,
-                )
-            ),
-            repository=repository,
-        )
-        app = create_app(runtime)
+        with patch.dict("os.environ", {"BACKEND_MAX_BORROW_DAYS": "30"}, clear=False):
+            repository = InMemoryTransactionRepository(initial_assets={"AS-BR-1001": AssetStatus.IN_STOCK})
+            runtime = self.build_runtime(
+                serial_manager=FakeSerialManager(
+                    response_factory=lambda payload, seq_id: self.build_event_frame(
+                        payload,
+                        confirm_result=ConfirmResult.CONFIRMED.value,
+                    )
+                ),
+                repository=repository,
+            )
+            app = create_app(runtime)
 
-        with TestClient(app) as client:
-            create_response = client.post(
-                "/borrow-requests",
-                json={
-                    "asset_id": "AS-BR-1001",
-                    "user_id": "U-BR-1001",
-                    "user_name": "Borrow User",
-                    "reason": "Project demo",
-                },
-            )
-            request_id = create_response.json()["item"]["request_id"]
-            pending_response = client.get("/borrow-requests?status=PENDING&asset_id=AS-BR-1001")
-            approve_response = client.post(
-                f"/borrow-requests/{request_id}/approve",
-                json={
-                    "reviewer_user_id": "U-ADMIN",
-                    "reviewer_user_name": "Admin User",
-                    "review_comment": "approved",
-                },
-            )
-            approved_response = client.get("/borrow-requests?status=APPROVED&applicant_user_id=U-BR-1001")
-            start_response = client.post(
-                f"/borrow-requests/{request_id}/start-borrow",
-                json={"timeout_ms": 300},
-            )
-            consumed_response = client.get("/borrow-requests?status=CONSUMED&asset_id=AS-BR-1001")
-            assets_response = client.get("/assets")
+            with TestClient(app) as client:
+                create_response = client.post(
+                    "/borrow-requests",
+                    json={
+                        "asset_id": "AS-BR-1001",
+                        "user_id": "U-BR-1001",
+                        "user_name": "Borrow User",
+                        "reason": "Project demo",
+                        "requested_days": 7,
+                    },
+                )
+                request_id = create_response.json()["item"]["request_id"]
+                pending_response = client.get("/borrow-requests?status=PENDING&asset_id=AS-BR-1001")
+                approve_response = client.post(
+                    f"/borrow-requests/{request_id}/approve",
+                    json={
+                        "reviewer_user_id": "U-ADMIN",
+                        "reviewer_user_name": "Admin User",
+                        "review_comment": "approved",
+                    },
+                )
+                approved_response = client.get("/borrow-requests?status=APPROVED&applicant_user_id=U-BR-1001")
+                start_response = client.post(
+                    f"/borrow-requests/{request_id}/start-borrow",
+                    json={"timeout_ms": 300},
+                )
+                consumed_response = client.get("/borrow-requests?status=CONSUMED&asset_id=AS-BR-1001")
+                assets_response = client.get("/assets")
 
         self.assertEqual(create_response.status_code, 200)
         self.assertEqual(create_response.json()["code"], "REQUEST_CREATED")
         self.assertEqual(create_response.json()["item"]["status"], "PENDING")
+        self.assertEqual(create_response.json()["item"]["requested_days"], 7)
         self.assertEqual(pending_response.status_code, 200)
         self.assertEqual(pending_response.json()["total"], 1)
         self.assertEqual(pending_response.json()["items"][0]["request_id"], request_id)
+        self.assertEqual(pending_response.json()["items"][0]["requested_days"], 7)
         self.assertEqual(approve_response.status_code, 200)
         self.assertEqual(approve_response.json()["code"], "REQUEST_APPROVED")
         self.assertEqual(approve_response.json()["item"]["status"], "APPROVED")
@@ -533,10 +737,62 @@ class ApiAppTests(unittest.TestCase):
         self.assertTrue(start_response.json()["success"])
         self.assertEqual(start_response.json()["code"], ConfirmResult.CONFIRMED.value)
         self.assertEqual(start_response.json()["extra"]["borrow_request_id"], request_id)
+        self.assertEqual(start_response.json()["extra"]["requested_days"], 7)
+        self.assertTrue(start_response.json()["extra"]["due_time"])
         self.assertEqual(consumed_response.status_code, 200)
         self.assertEqual(consumed_response.json()["total"], 1)
         self.assertEqual(consumed_response.json()["items"][0]["status"], "CONSUMED")
+        self.assertEqual(consumed_response.json()["items"][0]["requested_days"], 7)
         self.assertEqual(assets_response.json()["AS-BR-1001"], AssetStatus.BORROWED.value)
+
+    def test_borrow_request_api_accepts_requested_days_at_max_boundary(self) -> None:
+        with patch.dict("os.environ", {"BACKEND_MAX_BORROW_DAYS": "30"}, clear=False):
+            repository = InMemoryTransactionRepository(initial_assets={"AS-BR-1012": AssetStatus.IN_STOCK})
+            runtime = self.build_runtime(
+                serial_manager=FakeSerialManager(
+                    response_factory=lambda payload, seq_id: self.build_event_frame(
+                        payload,
+                        confirm_result=ConfirmResult.CONFIRMED.value,
+                    )
+                ),
+                repository=repository,
+            )
+            app = create_app(runtime)
+
+            with TestClient(app) as client:
+                create_response = client.post(
+                    "/borrow-requests",
+                    json={
+                        "asset_id": "AS-BR-1012",
+                        "user_id": "U-BR-1012",
+                        "user_name": "Borrow User",
+                        "reason": "Max boundary",
+                        "requested_days": 30,
+                    },
+                )
+                request_id = create_response.json()["item"]["request_id"]
+                approve_response = client.post(
+                    f"/borrow-requests/{request_id}/approve",
+                    json={
+                        "reviewer_user_id": "U-ADMIN",
+                        "reviewer_user_name": "Admin User",
+                        "review_comment": "approved",
+                    },
+                )
+                start_response = client.post(
+                    f"/borrow-requests/{request_id}/start-borrow",
+                    json={"timeout_ms": 300},
+                )
+
+        self.assertEqual(create_response.status_code, 200)
+        self.assertTrue(create_response.json()["success"])
+        self.assertEqual(create_response.json()["item"]["requested_days"], 30)
+        self.assertEqual(approve_response.status_code, 200)
+        self.assertTrue(approve_response.json()["success"])
+        self.assertEqual(start_response.status_code, 200)
+        self.assertTrue(start_response.json()["success"])
+        self.assertEqual(start_response.json()["extra"]["requested_days"], 30)
+        self.assertTrue(start_response.json()["extra"]["due_time"])
 
     def test_borrow_request_api_non_admin_cannot_approve_and_request_stays_pending(self) -> None:
         runtime = self.build_runtime(
@@ -813,6 +1069,54 @@ class ApiAppTests(unittest.TestCase):
         self.assertEqual(list_response.status_code, 200)
         self.assertEqual(list_response.json()["total"], 0)
 
+    def test_borrow_request_api_rejects_requested_days_exceeding_max(self) -> None:
+        with patch.dict("os.environ", {"BACKEND_MAX_BORROW_DAYS": "30"}, clear=False):
+            runtime = self.build_runtime(
+                serial_manager=FakeSerialManager(),
+                initial_assets={"AS-BR-1010": AssetStatus.IN_STOCK},
+            )
+            app = create_app(runtime)
+
+            with TestClient(app) as client:
+                response = client.post(
+                    "/borrow-requests",
+                    json={
+                        "asset_id": "AS-BR-1010",
+                        "user_id": "U-BR-1010",
+                        "user_name": "Borrow User",
+                        "reason": "Too long",
+                        "requested_days": 31,
+                    },
+                )
+                list_response = client.get("/borrow-requests?asset_id=AS-BR-1010")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["success"])
+        self.assertEqual(response.json()["code"], ConfirmResult.PARAM_INVALID.value)
+        self.assertIn("MAX_BORROW_DAYS", response.json()["message"])
+        self.assertEqual(list_response.json()["total"], 0)
+
+    def test_borrow_request_api_rejects_non_positive_requested_days_with_422(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-BR-1011": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1011",
+                    "user_id": "U-BR-1011",
+                    "user_name": "Borrow User",
+                    "reason": "Invalid days",
+                    "requested_days": 0,
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+
     def test_dashboard_returns_summary_operation_stats_and_top_assets(self) -> None:
         repository = InMemoryTransactionRepository(
             initial_assets={
@@ -869,6 +1173,7 @@ class ApiAppTests(unittest.TestCase):
                 "return_count": 1,
             },
         )
+        self.assertEqual(payload["exception_stats"], {"overdue_count": 0})
         self.assertEqual(payload["borrow_top_assets"], [{"asset_id": "AS-1002", "count": 2}])
         self.assertEqual(payload["available_filters"]["time_ranges"], ["all", "today", "7d", "30d"])
         self.assertEqual(payload["available_filters"]["categories"], [])
@@ -1280,6 +1585,113 @@ class ApiAppTests(unittest.TestCase):
         self.assertIn("hw_seq", item)
         self.assertIn("hw_result", item)
 
+    def test_borrow_busy_failure_is_recorded_in_exceptions_feed(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(
+                send_result=SendResult(
+                    success=False,
+                    seq_id=100,
+                    ack_type=MsgType.ACK_BUSY,
+                    message="DEVICE_BUSY",
+                    ack_payload={"detail": "DEVICE_BUSY"},
+                )
+            ),
+            initial_assets={"AS-9402": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            failure_response = client.post(
+                "/transactions/borrow",
+                json={"asset_id": "AS-9402", "user_id": "U-9402", "user_name": "User Busy", "timeout_ms": 100},
+            )
+            response = client.get("/exceptions?asset_id=AS-9402&action_type=BORROW&code=BUSY&time_range=all")
+
+        self.assertEqual(failure_response.status_code, 200)
+        self.assertEqual(failure_response.json()["code"], ConfirmResult.BUSY.value)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["asset_id"], "AS-9402")
+        self.assertEqual(payload["items"][0]["action_type"], ActionType.BORROW.value)
+        self.assertEqual(payload["items"][0]["code"], ConfirmResult.BUSY.value)
+        self.assertIn(ConfirmResult.BUSY.value, payload["available_filters"]["codes"])
+
+    def test_inbound_state_invalid_failure_is_recorded_in_exceptions_feed(self) -> None:
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(),
+            initial_assets={"AS-9403": AssetStatus.IN_STOCK},
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            failure_response = client.post(
+                "/transactions/inbound",
+                json={
+                    "asset_id": "AS-9403",
+                    "user_id": "U-ADMIN",
+                    "user_name": "Admin",
+                    "asset_name": "Existing Monitor",
+                    "category_id": 1,
+                    "location": "Shelf A",
+                    "timeout_ms": 100,
+                },
+            )
+            response = client.get("/exceptions?asset_id=AS-9403&action_type=INBOUND&code=STATE_INVALID&time_range=all")
+
+        self.assertEqual(failure_response.status_code, 200)
+        self.assertEqual(failure_response.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["asset_id"], "AS-9403")
+        self.assertEqual(payload["items"][0]["action_type"], ActionType.INBOUND.value)
+        self.assertEqual(payload["items"][0]["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertIn(ConfirmResult.STATE_INVALID.value, payload["available_filters"]["codes"])
+
+    def test_overdue_assets_are_visible_in_exceptions_export_and_dashboard(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-9404": AssetStatus.BORROWED})
+        borrow_record = self.build_operation_record(
+            asset_id="AS-9404",
+            user_id="U-9404",
+            action_type=ActionType.BORROW,
+            request_seq=404,
+        )
+        borrow_record.due_time = (datetime.now() - timedelta(days=2)).isoformat(sep=" ", timespec="seconds")
+        repository.records.append(borrow_record)
+
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            exceptions_response = client.get("/exceptions?asset_id=AS-9404&action_type=BORROW&code=OVERDUE&time_range=all")
+            export_response = client.get("/export/exceptions.csv?asset_id=AS-9404&code=OVERDUE&time_range=all")
+            dashboard_response = client.get("/dashboard?time_range=all")
+
+        self.assertEqual(exceptions_response.status_code, 200)
+        exceptions_payload = exceptions_response.json()
+        self.assertEqual(exceptions_payload["total"], 1)
+        self.assertIn("OVERDUE", exceptions_payload["available_filters"]["codes"])
+        overdue_item = exceptions_payload["items"][0]
+        self.assertEqual(overdue_item["asset_id"], "AS-9404")
+        self.assertEqual(overdue_item["action_type"], ActionType.BORROW.value)
+        self.assertEqual(overdue_item["user_id"], "U-9404")
+        self.assertEqual(overdue_item["code"], "OVERDUE")
+        self.assertEqual(overdue_item["message"], "borrow due_time exceeded")
+        self.assertEqual(overdue_item["request_seq"], 404)
+        self.assertEqual(overdue_item["hw_result"], ConfirmResult.CONFIRMED.value)
+
+        self.assertEqual(export_response.status_code, 200)
+        csv_text = self.decode_csv_body(export_response)
+        self.assertIn(
+            "AS-9404,BORROW,U-9404,Dashboard Tester,OVERDUE,borrow due_time exceeded",
+            csv_text,
+        )
+
+        self.assertEqual(dashboard_response.status_code, 200)
+        dashboard_payload = dashboard_response.json()
+        self.assertEqual(dashboard_payload["exception_stats"], {"overdue_count": 1})
+
     def test_exceptions_time_range_filter_works_for_runtime_records(self) -> None:
         runtime = self.build_runtime(
             serial_manager=FakeSerialManager(),
@@ -1497,6 +1909,187 @@ class ApiAppTests(unittest.TestCase):
         finally:
             if os.path.exists(db_path):
                 os.remove(db_path)
+
+    def test_return_acceptance_create_list_export_and_duplicate_rejection(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-RA-1001": AssetStatus.IN_STOCK})
+        repository.records.append(
+            self.build_operation_record(
+                asset_id="AS-RA-1001",
+                user_id="U-1001",
+                action_type=ActionType.RETURN,
+                request_seq=9101,
+            )
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1001",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.NORMAL.value,
+                    "note": "checked",
+                },
+            )
+            duplicate_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1001",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.NORMAL.value,
+                },
+            )
+            list_response = client.get(
+                "/return-acceptances?asset_id=AS-RA-1001&acceptance_result=NORMAL&accepted_by_user_id=U-ADMIN&time_range=all"
+            )
+            export_response = client.get("/export/return-acceptances.csv?asset_id=AS-RA-1001&time_range=all")
+
+        self.assertEqual(create_response.status_code, 200)
+        self.assertTrue(create_response.json()["success"])
+        self.assertEqual(create_response.json()["code"], "ACCEPTANCE_CREATED")
+        self.assertEqual(create_response.json()["item"]["related_return_request_seq"], 9101)
+        self.assertEqual(create_response.json()["item"]["related_return_hw_seq"], 0x80000000 + 9101)
+        self.assertEqual(duplicate_response.status_code, 200)
+        self.assertFalse(duplicate_response.json()["success"])
+        self.assertEqual(duplicate_response.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.json()["total"], 1)
+        self.assertEqual(list_response.json()["items"][0]["acceptance_result"], AcceptanceResult.NORMAL.value)
+        self.assertEqual(export_response.status_code, 200)
+        self.assertIn("return_acceptances_export.csv", export_response.headers.get("content-disposition", ""))
+        csv_text = self.decode_csv_body(export_response)
+        self.assertIn(
+            "asset_id,acceptance_result,note,accepted_by_user_id,accepted_by_user_name,accepted_at,related_return_request_seq,related_return_request_id,related_return_hw_seq",
+            csv_text,
+        )
+        self.assertIn("AS-RA-1001,NORMAL,checked,U-ADMIN,Admin", csv_text)
+
+    def test_return_acceptance_api_supports_damaged_and_missing_parts_results(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={
+                "AS-RA-1002": AssetStatus.IN_STOCK,
+                "AS-RA-1003": AssetStatus.IN_STOCK,
+            }
+        )
+        repository.records.extend(
+            [
+                self.build_operation_record(
+                    asset_id="AS-RA-1002",
+                    user_id="U-1002",
+                    action_type=ActionType.RETURN,
+                    request_seq=9102,
+                ),
+                self.build_operation_record(
+                    asset_id="AS-RA-1003",
+                    user_id="U-1003",
+                    action_type=ActionType.RETURN,
+                    request_seq=9103,
+                ),
+            ]
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            damaged_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1002",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.DAMAGED.value,
+                },
+            )
+            missing_parts_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1003",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.MISSING_PARTS.value,
+                },
+            )
+            damaged_list = client.get("/return-acceptances?acceptance_result=DAMAGED&time_range=all")
+            missing_parts_list = client.get("/return-acceptances?acceptance_result=MISSING_PARTS&time_range=all")
+
+        self.assertTrue(damaged_response.json()["success"])
+        self.assertEqual(damaged_response.json()["item"]["acceptance_result"], AcceptanceResult.DAMAGED.value)
+        self.assertTrue(missing_parts_response.json()["success"])
+        self.assertEqual(
+            missing_parts_response.json()["item"]["acceptance_result"],
+            AcceptanceResult.MISSING_PARTS.value,
+        )
+        self.assertEqual(damaged_list.json()["total"], 1)
+        self.assertEqual(missing_parts_list.json()["total"], 1)
+
+    def test_return_acceptance_api_rejects_non_admin_no_return_trace_and_invalid_payload(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={
+                "AS-RA-1004": AssetStatus.IN_STOCK,
+                "AS-RA-1005": AssetStatus.IN_STOCK,
+            }
+        )
+        repository.records.append(
+            self.build_operation_record(
+                asset_id="AS-RA-1004",
+                user_id="U-1004",
+                action_type=ActionType.RETURN,
+                request_seq=9104,
+            )
+        )
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), repository=repository)
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            non_admin_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1004",
+                    "accepted_by_user_id": "U-1004",
+                    "accepted_by_user_name": "Borrower",
+                    "acceptance_result": AcceptanceResult.NORMAL.value,
+                },
+            )
+            no_return_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1005",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.NORMAL.value,
+                },
+            )
+            invalid_result_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "AS-RA-1004",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": "BROKEN",
+                },
+            )
+            blank_asset_response = client.post(
+                "/return-acceptances",
+                json={
+                    "asset_id": "   ",
+                    "accepted_by_user_id": "U-ADMIN",
+                    "accepted_by_user_name": "Admin",
+                    "acceptance_result": AcceptanceResult.NORMAL.value,
+                },
+            )
+
+        self.assertEqual(non_admin_response.status_code, 200)
+        self.assertFalse(non_admin_response.json()["success"])
+        self.assertEqual(non_admin_response.json()["code"], ConfirmResult.PERMISSION_DENIED.value)
+        self.assertEqual(no_return_response.status_code, 200)
+        self.assertFalse(no_return_response.json()["success"])
+        self.assertEqual(no_return_response.json()["code"], ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(invalid_result_response.status_code, 422)
+        self.assertEqual(blank_asset_response.status_code, 422)
 
     def test_export_exceptions_csv_respects_asset_action_and_code_filters(self) -> None:
         runtime = self.build_runtime(

@@ -4,16 +4,22 @@ import threading
 import time
 import unittest
 from typing import Callable
+from unittest.mock import patch
 
 import runtime_paths  # noqa: F401
 from models import (
+    AcceptanceResult,
     ActionType,
     AssetStatus,
     BorrowApprovalCommand,
     BorrowRequestCreateCommand,
     BorrowRequestStatus,
     ConfirmResult,
+    DEFAULT_MAX_BORROW_DAYS,
     InboundCommand,
+    OperationRecordInput,
+    RoleType,
+    ReturnAcceptanceCreateCommand,
     TransactionState,
 )
 from protocol import Frame, MsgType
@@ -435,53 +441,332 @@ class AssetConfirmServiceTests(unittest.TestCase):
         self.assertEqual(repository.list_borrow_requests(), [])
 
     def test_borrow_request_can_be_approved_and_started(self) -> None:
+        with patch.dict("os.environ", {"BACKEND_MAX_BORROW_DAYS": str(DEFAULT_MAX_BORROW_DAYS)}, clear=False):
+            serial_manager = FakeSerialManager(
+                response_factory=lambda payload, seq_id: self.build_event_frame(
+                    payload,
+                    confirm_result=ConfirmResult.CONFIRMED.value,
+                )
+            )
+            repository = InMemoryTransactionRepository(initial_assets={"AS-6201": AssetStatus.IN_STOCK})
+            service = AssetConfirmService(serial_manager=serial_manager, repository=repository)
+
+            created = service.create_borrow_request(
+                BorrowRequestCreateCommand(
+                    asset_id="AS-6201",
+                    user_id="U-6201",
+                    user_name="Requester",
+                    reason="Temporary use",
+                    requested_days=7,
+                )
+            )
+            self.assertTrue(created.success)
+            self.assertIsNotNone(created.item)
+            request_id = created.item.request_id
+            self.assertEqual(created.item.status, BorrowRequestStatus.PENDING)
+            self.assertEqual(created.item.requested_days, 7)
+
+            reviewed = service.review_borrow_request(
+                BorrowApprovalCommand(
+                    request_id=request_id,
+                    reviewer_user_id="U-ADMIN",
+                    reviewer_user_name="Admin",
+                    approved=True,
+                    review_comment="approved",
+                )
+            )
+            self.assertTrue(reviewed.success)
+            self.assertIsNotNone(reviewed.item)
+            self.assertEqual(reviewed.item.status, BorrowRequestStatus.APPROVED)
+
+            result = service.start_borrow_from_request(request_id, timeout_ms=100)
+
+            self.assertTrue(result.success)
+            self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+            self.assertEqual(result.transaction_state, TransactionState.COMPLETED)
+            self.assertEqual(repository.assets["AS-6201"], AssetStatus.BORROWED)
+            self.assertEqual(len(repository.records), 1)
+            self.assertEqual(repository.records[0].borrow_request_id, request_id)
+            self.assertIsNotNone(repository.records[0].due_time)
+            self.assertEqual(result.extra["requested_days"], 7)
+            self.assertEqual(result.extra["due_time"], repository.records[0].due_time)
+            stored = repository.get_borrow_request(request_id)
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.status, BorrowRequestStatus.CONSUMED)
+            self.assertIsNotNone(stored.consumed_at)
+
+    def test_role_resolution_is_consistent_across_inbound_review_and_acceptance(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={
+                "AS-6202": AssetStatus.IN_STOCK,
+                "AS-6203": AssetStatus.IN_STOCK,
+            }
+        )
+        repository.records.append(
+            OperationRecordInput(
+                asset_id="AS-6203",
+                user_id="U-6203",
+                user_name="Borrower",
+                action_type=ActionType.RETURN,
+                request_seq=6203,
+                request_id="req-6203",
+                hw_seq=0x80000023,
+                hw_result=ConfirmResult.CONFIRMED.value,
+                hw_sn="STM32F103-A23",
+            )
+        )
+        service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+
+        self.assertEqual(service.resolve_user_role("U-ADMIN"), RoleType.ADMIN)
+        self.assertEqual(service.resolve_user_role("U-6202"), RoleType.BORROWER)
+
+        inbound_result = service.request_asset_inbound_confirm(
+            asset_id="AS-NEW-6202",
+            user_id="U-NORMAL",
+            user_name="Normal User",
+            asset_name="New Device",
+            location="Shelf A",
+            category_id=1,
+            timeout_ms=100,
+        )
+        review_result = service.review_borrow_request(
+            BorrowApprovalCommand(
+                request_id="missing-request",
+                reviewer_user_id="U-NORMAL",
+                reviewer_user_name="Normal User",
+                approved=True,
+            )
+        )
+        acceptance_result = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6203",
+                accepted_by_user_id="U-NORMAL",
+                accepted_by_user_name="Normal User",
+                acceptance_result=AcceptanceResult.NORMAL,
+            )
+        )
+
+        self.assertEqual(inbound_result.code, ConfirmResult.PERMISSION_DENIED.value)
+        self.assertEqual(review_result.code, ConfirmResult.PERMISSION_DENIED.value)
+        self.assertEqual(acceptance_result.code, ConfirmResult.PERMISSION_DENIED.value)
+
+    def test_borrower_can_still_create_borrow_request_with_default_requested_days(self) -> None:
+        with patch.dict("os.environ", {"BACKEND_MAX_BORROW_DAYS": str(DEFAULT_MAX_BORROW_DAYS)}, clear=False):
+            repository = InMemoryTransactionRepository(initial_assets={"AS-6204": AssetStatus.IN_STOCK})
+            service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+
+            result = service.create_borrow_request(
+                BorrowRequestCreateCommand(
+                    asset_id="AS-6204",
+                    user_id="U-6204",
+                    user_name="Requester",
+                    reason="Default requested days",
+                )
+            )
+
+            self.assertTrue(result.success)
+            self.assertIsNotNone(result.item)
+            self.assertEqual(result.item.requested_days, DEFAULT_MAX_BORROW_DAYS)
+
+    def test_borrow_request_rejects_when_requested_days_exceeds_max(self) -> None:
+        with patch.dict("os.environ", {"BACKEND_MAX_BORROW_DAYS": str(DEFAULT_MAX_BORROW_DAYS)}, clear=False):
+            repository = InMemoryTransactionRepository(initial_assets={"AS-6205": AssetStatus.IN_STOCK})
+            service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+
+            result = service.create_borrow_request(
+                BorrowRequestCreateCommand(
+                    asset_id="AS-6205",
+                    user_id="U-6205",
+                    user_name="Requester",
+                    reason="Too long",
+                    requested_days=DEFAULT_MAX_BORROW_DAYS + 1,
+                )
+            )
+
+            self.assertFalse(result.success)
+            self.assertEqual(result.code, ConfirmResult.PARAM_INVALID.value)
+            self.assertEqual(repository.list_borrow_requests(asset_id="AS-6205"), [])
+
+    def test_admin_can_create_return_acceptance_after_successful_return(self) -> None:
         serial_manager = FakeSerialManager(
             response_factory=lambda payload, seq_id: self.build_event_frame(
                 payload,
                 confirm_result=ConfirmResult.CONFIRMED.value,
             )
         )
-        repository = InMemoryTransactionRepository(initial_assets={"AS-6201": AssetStatus.IN_STOCK})
+        repository = InMemoryTransactionRepository(initial_assets={"AS-6301": AssetStatus.BORROWED})
         service = AssetConfirmService(serial_manager=serial_manager, repository=repository)
 
-        created = service.create_borrow_request(
-            BorrowRequestCreateCommand(
-                asset_id="AS-6201",
-                user_id="U-6201",
-                user_name="Requester",
-                reason="Temporary use",
+        return_result = service.request_asset_return_confirm(
+            asset_id="AS-6301",
+            user_id="U-6301",
+            user_name="Borrower",
+            timeout_ms=100,
+        )
+        acceptance_result = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6301",
+                accepted_by_user_id="U-ADMIN",
+                accepted_by_user_name="Admin",
+                acceptance_result=AcceptanceResult.NORMAL,
+                note="all good",
             )
         )
-        self.assertTrue(created.success)
-        self.assertIsNotNone(created.item)
-        request_id = created.item.request_id
-        self.assertEqual(created.item.status, BorrowRequestStatus.PENDING)
 
-        reviewed = service.review_borrow_request(
-            BorrowApprovalCommand(
-                request_id=request_id,
-                reviewer_user_id="U-ADMIN",
-                reviewer_user_name="Admin",
-                approved=True,
-                review_comment="approved",
+        self.assertTrue(return_result.success)
+        self.assertTrue(acceptance_result.success)
+        self.assertEqual(acceptance_result.code, "ACCEPTANCE_CREATED")
+        self.assertIsNotNone(acceptance_result.item)
+        self.assertEqual(acceptance_result.item.acceptance_result, AcceptanceResult.NORMAL)
+        self.assertEqual(acceptance_result.item.related_return_request_seq, return_result.request_seq)
+        self.assertEqual(acceptance_result.item.related_return_hw_seq, return_result.hw_seq)
+        self.assertEqual(len(repository.list_return_acceptances(asset_id="AS-6301")), 1)
+
+    def test_return_acceptance_supports_damaged_and_missing_parts_results(self) -> None:
+        repository = InMemoryTransactionRepository(
+            initial_assets={
+                "AS-6302": AssetStatus.IN_STOCK,
+                "AS-6303": AssetStatus.IN_STOCK,
+            }
+        )
+        repository.records.extend(
+            [
+                OperationRecordInput(
+                    asset_id="AS-6302",
+                    user_id="U-6302",
+                    user_name="Borrower A",
+                    action_type=ActionType.RETURN,
+                    request_seq=6302,
+                    request_id="req-6302",
+                    hw_seq=0x80006302,
+                    hw_result=ConfirmResult.CONFIRMED.value,
+                    hw_sn="STM32F103-A23",
+                    due_time=None,
+                ),
+                OperationRecordInput(
+                    asset_id="AS-6303",
+                    user_id="U-6303",
+                    user_name="Borrower B",
+                    action_type=ActionType.RETURN,
+                    request_seq=6303,
+                    request_id="req-6303",
+                    hw_seq=0x80006303,
+                    hw_result=ConfirmResult.CONFIRMED.value,
+                    hw_sn="STM32F103-A23",
+                    due_time=None,
+                ),
+            ]
+        )
+        service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+
+        damaged = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6302",
+                accepted_by_user_id="U-ADMIN",
+                accepted_by_user_name="Admin",
+                acceptance_result=AcceptanceResult.DAMAGED,
             )
         )
-        self.assertTrue(reviewed.success)
-        self.assertIsNotNone(reviewed.item)
-        self.assertEqual(reviewed.item.status, BorrowRequestStatus.APPROVED)
+        missing_parts = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6303",
+                accepted_by_user_id="U-ADMIN",
+                accepted_by_user_name="Admin",
+                acceptance_result=AcceptanceResult.MISSING_PARTS,
+            )
+        )
 
-        result = service.start_borrow_from_request(request_id, timeout_ms=100)
+        self.assertTrue(damaged.success)
+        self.assertEqual(damaged.item.acceptance_result, AcceptanceResult.DAMAGED)
+        self.assertTrue(missing_parts.success)
+        self.assertEqual(missing_parts.item.acceptance_result, AcceptanceResult.MISSING_PARTS)
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
-        self.assertEqual(result.transaction_state, TransactionState.COMPLETED)
-        self.assertEqual(repository.assets["AS-6201"], AssetStatus.BORROWED)
-        self.assertEqual(len(repository.records), 1)
-        self.assertEqual(repository.records[0].borrow_request_id, request_id)
-        stored = repository.get_borrow_request(request_id)
-        self.assertIsNotNone(stored)
-        self.assertEqual(stored.status, BorrowRequestStatus.CONSUMED)
-        self.assertIsNotNone(stored.consumed_at)
+    def test_return_acceptance_rejects_non_admin_without_writing_record(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-6304": AssetStatus.IN_STOCK})
+        repository.records.append(
+            OperationRecordInput(
+                asset_id="AS-6304",
+                user_id="U-6304",
+                user_name="Borrower",
+                action_type=ActionType.RETURN,
+                request_seq=6304,
+                request_id="req-6304",
+                hw_seq=0x80006304,
+                hw_result=ConfirmResult.CONFIRMED.value,
+                hw_sn="STM32F103-A23",
+                due_time=None,
+            )
+        )
+        service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+
+        result = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6304",
+                accepted_by_user_id="U-6304",
+                accepted_by_user_name="Borrower",
+                acceptance_result=AcceptanceResult.NORMAL,
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.code, ConfirmResult.PERMISSION_DENIED.value)
+        self.assertEqual(repository.list_return_acceptances(asset_id="AS-6304"), [])
+
+    def test_return_acceptance_rejects_when_no_completed_return_trace_exists(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-6305": AssetStatus.IN_STOCK})
+        service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+
+        result = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6305",
+                accepted_by_user_id="U-ADMIN",
+                accepted_by_user_name="Admin",
+                acceptance_result=AcceptanceResult.NORMAL,
+            )
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.code, ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(repository.list_return_acceptances(asset_id="AS-6305"), [])
+
+    def test_return_acceptance_rejects_duplicate_for_latest_return(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-6306": AssetStatus.IN_STOCK})
+        repository.records.append(
+            OperationRecordInput(
+                asset_id="AS-6306",
+                user_id="U-6306",
+                user_name="Borrower",
+                action_type=ActionType.RETURN,
+                request_seq=6306,
+                request_id="req-6306",
+                hw_seq=0x80006306,
+                hw_result=ConfirmResult.CONFIRMED.value,
+                hw_sn="STM32F103-A23",
+                due_time=None,
+            )
+        )
+        service = AssetConfirmService(serial_manager=FakeSerialManager(), repository=repository)
+        first = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6306",
+                accepted_by_user_id="U-ADMIN",
+                accepted_by_user_name="Admin",
+                acceptance_result=AcceptanceResult.NORMAL,
+            )
+        )
+        second = service.create_return_acceptance(
+            ReturnAcceptanceCreateCommand(
+                asset_id="AS-6306",
+                accepted_by_user_id="U-ADMIN",
+                accepted_by_user_name="Admin",
+                acceptance_result=AcceptanceResult.NORMAL,
+            )
+        )
+
+        self.assertTrue(first.success)
+        self.assertFalse(second.success)
+        self.assertEqual(second.code, ConfirmResult.STATE_INVALID.value)
+        self.assertEqual(len(repository.list_return_acceptances(asset_id="AS-6306")), 1)
 
     def test_successful_inbound_creates_new_asset_and_records_hw_fields(self) -> None:
         serial_manager = FakeSerialManager(

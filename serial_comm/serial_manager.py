@@ -183,7 +183,7 @@ class SerialManager:
 
     def send_request(self, msg_type: MsgType, payload: dict[str, Any], seq_id: int | None = None) -> SendResult:
         if not self.is_open:
-            return SendResult(False, -1, None, "串口未打开")
+            return SendResult(False, -1, None, "serial port is not open")
 
         actual_seq_id = self._next_seq_id() if seq_id is None else seq_id
         wire_payload = dict(payload)
@@ -217,7 +217,7 @@ class SerialManager:
                 LOGGER.warning("ack timeout: seq_id=%s retry=%s/%s", actual_seq_id, attempt, self.max_retries)
 
             self._set_device_status(DeviceStatus.OFFLINE)
-            return SendResult(False, actual_seq_id, None, f"ACK 超时，已重传 {self.max_retries} 次", None)
+            return SendResult(False, actual_seq_id, None, f"ACK timeout after {self.max_retries} retries", None)
         finally:
             with self._pending_lock:
                 self._pending_acks.pop(actual_seq_id, None)
@@ -226,19 +226,45 @@ class SerialManager:
         return self.send_request(MsgType.CMD_SYS_NOTIFY, {"message": message})
 
     def _open_transport(self) -> Transport:
+        if self.port.startswith("socket://"):
+            LOGGER.info("serial using native socket transport: %s", self.port)
+            return SocketTransport(self.port, timeout=self.read_timeout)
         if serial is not None:
-            return serial.serial_for_url(
+            transport = serial.serial_for_url(
                 self.port,
                 baudrate=self.baudrate,
                 timeout=self.read_timeout,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
+                xonxoff=False,
+                rtscts=False,
+                dsrdtr=False,
+                write_timeout=self.read_timeout,
+                do_not_open=True,
             )
-        if self.port.startswith("socket://"):
-            LOGGER.warning("pyserial not installed, fallback to socket transport for %s", self.port)
-            return SocketTransport(self.port, timeout=self.read_timeout)
-        raise RuntimeError("pyserial 未安装，真实串口模式无法使用。请先执行: pip install pyserial")
+            try:
+                transport.dtr = False
+                transport.rts = False
+                transport.open()
+                transport.dtr = False
+                transport.rts = False
+                transport.reset_input_buffer()
+                transport.reset_output_buffer()
+            except Exception:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+                raise
+            LOGGER.info(
+                "real serial opened with dtr=%s rts=%s flow_control=off write_timeout=%s buffers_reset=true",
+                transport.dtr,
+                transport.rts,
+                getattr(transport, "write_timeout", self.read_timeout),
+            )
+            return transport
+        raise RuntimeError("pyserial is required for non-socket serial ports. Run: pip install pyserial")
 
     def _reader_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -248,9 +274,12 @@ class SerialManager:
             try:
                 chunk = transport.read(1024)
             except Exception as exc:
+                if self._stop_event.is_set() or transport is not self._transport or not transport.is_open:
+                    LOGGER.info("serial reader stopped during shutdown: port=%s reason=%s", self.port, exc)
+                    return
                 LOGGER.exception("serial read failed: %s", exc)
                 self._set_device_status(DeviceStatus.OFFLINE)
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
 
             if not chunk:
@@ -259,7 +288,11 @@ class SerialManager:
             self._last_received_at = time.monotonic()
             self._set_device_status(DeviceStatus.ONLINE)
             for event in self._parser.feed(chunk):
-                self._handle_parser_event(event)
+                try:
+                    self._handle_parser_event(event)
+                except Exception as exc:
+                    LOGGER.exception("serial frame handling failed; reader will continue: %s", exc)
+                    time.sleep(0.1)
 
     def _monitor_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -395,14 +428,14 @@ class SerialManager:
     @staticmethod
     def _default_ack_message(ack_type: MsgType | None) -> str:
         if ack_type == MsgType.ACK_OK:
-            return "ACK 确认成功"
+            return "ACK_OK"
         if ack_type == MsgType.ACK_BUSY:
-            return "设备忙，请稍后重试"
+            return "DEVICE_BUSY"
         if ack_type == MsgType.ACK_INVALID:
-            return "设备返回 ACK_INVALID"
+            return "ACK_INVALID"
         if ack_type == MsgType.ACK_ERROR:
-            return "设备返回 ACK_ERROR"
-        return "未知 ACK"
+            return "ACK_ERROR"
+        return "UNKNOWN_ACK"
 
     @staticmethod
     def _safe_payload_text(payload: Any) -> str:

@@ -5,7 +5,7 @@ import unittest
 
 import runtime_paths  # noqa: F401
 from mock_mcu import MockMCUServer
-from models import AssetStatus, ConfirmResult, TransactionState
+from models import ActionType, AssetStatus, ConfirmResult, TransactionState
 from repository import InMemoryTransactionRepository
 from serial_manager import SerialManager
 from service import AssetConfirmService
@@ -18,7 +18,7 @@ class SerialIntegrationFlowTests(unittest.TestCase):
         *,
         port: int,
         mode: str,
-        initial_status: AssetStatus,
+        initial_status: AssetStatus | None,
         action: str,
         timeout_ms: int = 200,
         confirm_delay: float = 0.05,
@@ -32,7 +32,8 @@ class SerialIntegrationFlowTests(unittest.TestCase):
             ack_timeout=0.1,
             max_retries=3,
         )
-        repository = InMemoryTransactionRepository(initial_assets={"AS-2001": initial_status})
+        initial_assets = {} if initial_status is None else {"AS-2001": initial_status}
+        repository = InMemoryTransactionRepository(initial_assets=initial_assets)
         service = AssetConfirmService(
             serial_manager=serial_manager,
             repository=repository,
@@ -46,14 +47,25 @@ class SerialIntegrationFlowTests(unittest.TestCase):
                 result = service.request_asset_borrow_confirm(
                     asset_id="AS-2001",
                     user_id="U-2001",
-                    user_name="李青云",
+                    user_name="User Borrow",
                     timeout_ms=timeout_ms,
+                )
+            elif action == "inbound":
+                result = service.request_asset_inbound_confirm(
+                    asset_id="AS-2001",
+                    user_id="U-ADMIN",
+                    user_name="Admin",
+                    asset_name="Dell Monitor",
+                    location="Rack A",
+                    category_id=1,
+                    timeout_ms=timeout_ms,
+                    request_source="integration_test",
                 )
             else:
                 result = service.request_asset_return_confirm(
                     asset_id="AS-2001",
                     user_id="U-2001",
-                    user_name="李青云",
+                    user_name="User Return",
                     timeout_ms=timeout_ms,
                 )
             return result, repository
@@ -86,6 +98,22 @@ class SerialIntegrationFlowTests(unittest.TestCase):
         self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
         self.assertEqual(result.transaction_state, TransactionState.COMPLETED)
         self.assertEqual(repository.assets["AS-2001"], AssetStatus.IN_STOCK)
+
+    def test_inbound_success_via_real_serial_stack(self) -> None:
+        result, repository = self.run_scenario(
+            port=9207,
+            mode="confirmed",
+            initial_status=None,
+            action="inbound",
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+        self.assertEqual(result.transaction_state, TransactionState.COMPLETED)
+        self.assertEqual(repository.assets["AS-2001"], AssetStatus.IN_STOCK)
+        self.assertEqual(repository.asset_details["AS-2001"]["asset_name"], "Dell Monitor")
+        self.assertEqual(repository.asset_details["AS-2001"]["location"], "Rack A")
+        self.assertEqual(repository.records[0].action_type, ActionType.INBOUND)
 
     def test_ack_invalid_via_real_serial_stack(self) -> None:
         result, repository = self.run_scenario(

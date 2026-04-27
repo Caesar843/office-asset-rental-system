@@ -110,7 +110,35 @@ Real-device mode must show:
 - `configured_port` is `COMx` or `/dev/ttyUSBx`
 - it must not start with `socket://`
 
-### 2.4 Borrow demo
+### 2.4 Official real-device one-key rehearsals
+
+Borrow:
+
+```powershell
+python C:\Users\lenovo\office-asset-rental-system\backend_service\run_real_device_flow.py --action borrow --asset-id AS-0924 --user-id U-1001 --user-name "Demo Borrow" --repository-kind mysql --serial-port COM3 --timeout-ms 30000
+```
+
+Return:
+
+```powershell
+python C:\Users\lenovo\office-asset-rental-system\backend_service\run_real_device_flow.py --action return --asset-id AS-0925 --user-id U-1002 --user-name "Demo Return" --repository-kind mysql --serial-port COM3 --timeout-ms 30000
+```
+
+Inbound:
+
+```powershell
+python C:\Users\lenovo\office-asset-rental-system\backend_service\run_real_device_flow.py --action inbound --asset-id AS-0926 --user-id U-ADMIN --user-name "Demo Admin" --asset-name "Demo Inbound Asset" --category-id 1 --location "Inbound Shelf" --repository-kind mysql --serial-port COM3 --timeout-ms 30000
+```
+
+The script output must show:
+
+- `action == "inbound"`
+- `request_target == "/transactions/inbound"`
+- the JSON request body with `asset_id / user_id / user_name / asset_name / category_id / location / timeout_ms`
+- `api_response_body`
+- `websocket_messages`
+
+### 2.5 Borrow demo
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8000/transactions/borrow `
@@ -124,7 +152,7 @@ Observe:
 - the real device performs the physical confirmation step
 - WebSocket shows waiting states and the final state
 
-### 2.5 Return demo
+### 2.6 Return demo
 
 ```powershell
 curl.exe -X POST http://127.0.0.1:8000/transactions/return `
@@ -132,7 +160,25 @@ curl.exe -X POST http://127.0.0.1:8000/transactions/return `
   -d "{\"asset_id\":\"AS-0925\",\"user_id\":\"U-1002\",\"user_name\":\"Demo Return\",\"timeout_ms\":30000}"
 ```
 
-### 2.6 WebSocket observation
+### 2.7 Inbound demo
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/transactions/inbound `
+  -H "Content-Type: application/json" `
+  -d "{\"asset_id\":\"AS-0926\",\"user_id\":\"U-ADMIN\",\"user_name\":\"Demo Admin\",\"asset_name\":\"Demo Inbound Asset\",\"category_id\":1,\"location\":\"Inbound Shelf\",\"timeout_ms\":30000}"
+```
+
+Minimum success criteria:
+
+- API returns `success == true`
+- API returns `code == "CONFIRMED"`
+- `action_type == "INBOUND"`
+- `transaction_state == "COMPLETED"`
+- WebSocket shows `WAITING_ACK`, `WAITING_HW`, then the final success result
+- `assets` contains the new row with `qr_code == "AS-0926"` and `status == IN_STOCK`
+- `operation_records` contains one `op_type == "INBOUND"` row for the same asset, with `request_seq / request_id / hw_seq / hw_result / hw_sn`
+
+### 2.8 WebSocket observation
 
 Connect:
 
@@ -146,7 +192,13 @@ At minimum, observe:
 - `WAITING_HW`
 - `CONFIRMED` or the failure code
 
-### 2.7 DataGrip / MySQL observation
+For inbound rehearsals, also confirm the final WebSocket payload references:
+
+- `action_type == "INBOUND"`
+- the same `asset_id`
+- the same `request_seq` / `request_id`
+
+### 2.9 DataGrip / MySQL observation
 
 Focus on these tables:
 
@@ -160,6 +212,15 @@ Focus on these fields:
 - `operation_records.op_time`
 - `operation_records.hw_seq`
 - `operation_records.hw_result`
+
+For inbound, also check:
+
+- `assets.qr_code`
+- `assets.asset_name`
+- `assets.location`
+- `operation_records.request_seq`
+- `operation_records.request_id`
+- `operation_records.hw_sn`
 
 ## 3. Real Device Troubleshooting
 
@@ -220,9 +281,27 @@ python C:\Users\lenovo\office-asset-rental-system\backend_service\api_app.py
 
 ### 4.2 Validate the mock path
 
+Borrow:
+
 ```powershell
 python C:\Users\lenovo\office-asset-rental-system\backend_service\run_mock_api_flow.py --action borrow --asset-id AS-0924 --user-id U-1001 --user-name Demo --repository-kind mysql --mock-mode confirmed
 ```
+
+Inbound:
+
+```powershell
+python C:\Users\lenovo\office-asset-rental-system\backend_service\run_mock_api_flow.py --action inbound --asset-id AS-0926 --user-id U-ADMIN --user-name "Demo Admin" --asset-name "Demo Inbound Asset" --category-id 1 --location "Inbound Shelf" --repository-kind mysql --mock-mode confirmed --timeout-ms 3000
+```
+
+Minimum mock inbound success criteria:
+
+- script output shows `request_target == "/transactions/inbound"`
+- script output shows the inbound request body with `asset_name / category_id / location`
+- `api_response_body.success == true`
+- `api_response_body.code == "CONFIRMED"`
+- `websocket_messages` contains waiting states plus the final success result
+- `asset_snapshot_after` shows the new inbound asset
+- `repository_asset_status_after` is the in-stock value
 
 ### 4.3 Suggested judge-facing explanation
 
@@ -270,4 +349,6 @@ Run these in order before the competition:
 2. `check_real_serial_runtime.py`
 3. `run_real_device_flow.py --action borrow`
 4. `run_real_device_flow.py --action return`
-5. If the real device fails, run `start_demo_stack.py --transport-mode mock`
+5. `run_real_device_flow.py --action inbound`
+6. If the real device fails, run `start_demo_stack.py --transport-mode mock`
+7. In mock fallback mode, run `run_mock_api_flow.py --action inbound`

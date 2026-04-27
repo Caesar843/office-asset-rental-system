@@ -10,13 +10,25 @@ import time
 import runtime_paths  # noqa: F401
 from fastapi.testclient import TestClient
 
+ACTION_ENDPOINTS = {
+    "borrow": "/transactions/borrow",
+    "return": "/transactions/return",
+    "inbound": "/transactions/inbound",
+}
+DEFAULT_INBOUND_ASSET_NAME = "Demo Inbound Asset"
+DEFAULT_INBOUND_CATEGORY_ID = 1
+DEFAULT_INBOUND_LOCATION = "Inbound Shelf"
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run one full API + WebSocket rehearsal against a real serial device.")
-    parser.add_argument("--action", choices=("borrow", "return"), required=True)
+    parser.add_argument("--action", choices=tuple(ACTION_ENDPOINTS), required=True)
     parser.add_argument("--asset-id", required=True)
     parser.add_argument("--user-id", required=True)
     parser.add_argument("--user-name", required=True)
+    parser.add_argument("--asset-name", default=DEFAULT_INBOUND_ASSET_NAME)
+    parser.add_argument("--category-id", type=int, default=DEFAULT_INBOUND_CATEGORY_ID)
+    parser.add_argument("--location", default=DEFAULT_INBOUND_LOCATION)
     parser.add_argument("--timeout-ms", type=int, default=30000)
     parser.add_argument("--repository-kind", choices=("inmemory", "sqlite", "mysql"), default=os.getenv("BACKEND_REPOSITORY_KIND", "mysql"))
     parser.add_argument("--serial-port", default=os.getenv("BACKEND_SERIAL_PORT", ""))
@@ -42,7 +54,11 @@ def configure_logging(level: str) -> None:
 def infer_initial_status(args: argparse.Namespace) -> str:
     if args.initial_status:
         return args.initial_status
-    return "IN_STOCK" if args.action == "borrow" else "BORROWED"
+    if args.action == "borrow":
+        return "IN_STOCK"
+    if args.action == "return":
+        return "BORROWED"
+    return ""
 
 
 def configure_environment(args: argparse.Namespace) -> str:
@@ -59,10 +75,14 @@ def configure_environment(args: argparse.Namespace) -> str:
     os.environ["BACKEND_SERIAL_MAX_RETRIES"] = str(args.serial_max_retries)
     os.environ["BACKEND_SERIAL_OFFLINE_TIMEOUT"] = str(args.serial_offline_timeout)
     if args.repository_kind == "inmemory":
-        os.environ["BACKEND_INITIAL_ASSETS_JSON"] = json.dumps(
-            {args.asset_id: infer_initial_status(args)},
-            ensure_ascii=False,
-        )
+        initial_status = infer_initial_status(args)
+        if initial_status:
+            os.environ["BACKEND_INITIAL_ASSETS_JSON"] = json.dumps(
+                {args.asset_id: initial_status},
+                ensure_ascii=False,
+            )
+        else:
+            os.environ.pop("BACKEND_INITIAL_ASSETS_JSON", None)
     else:
         os.environ.pop("BACKEND_INITIAL_ASSETS_JSON", None)
     return serial_port
@@ -79,12 +99,21 @@ def collect_websocket_messages(websocket) -> list[dict[str, object]]:
 
 
 def build_request_payload(args: argparse.Namespace) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "asset_id": args.asset_id,
         "user_id": args.user_id,
         "user_name": args.user_name,
         "timeout_ms": args.timeout_ms,
     }
+    if args.action == "inbound":
+        payload.update(
+            {
+                "asset_name": args.asset_name,
+                "category_id": args.category_id,
+                "location": args.location,
+            }
+        )
+    return payload
 
 
 def main() -> int:
@@ -100,25 +129,32 @@ def main() -> int:
 
     runtime = build_default_runtime()
     app = create_app(runtime)
-    endpoint = "/transactions/borrow" if args.action == "borrow" else "/transactions/return"
+    endpoint = ACTION_ENDPOINTS[args.action]
     transport_mode = "socket_override" if serial_port.startswith("socket://") else "real_serial"
+    request_body = build_request_payload(args)
 
     with TestClient(app) as client:
         time.sleep(args.health_wait)
         health_before = client.get("/health").json()
         with client.websocket_connect("/ws/status") as websocket:
-            response = client.post(endpoint, json=build_request_payload(args))
+            response = client.post(endpoint, json=request_body)
             websocket_messages = collect_websocket_messages(websocket)
         health_after = client.get("/health").json()
         asset_snapshot = client.get(f"/assets/{args.asset_id}").json()
 
     final_asset_status = runtime.repository.get_asset_status(args.asset_id)
+    response_body = response.json()
     payload = {
+        "action": args.action,
         "transport_mode": transport_mode,
         "repository_kind": args.repository_kind,
         "serial_port": serial_port,
+        "request_target": endpoint,
+        "request_body": request_body,
+        "api_status_code": response.status_code,
+        "api_response_body": response_body,
         "health_before": health_before,
-        "api_result": response.json(),
+        "api_result": response_body,
         "websocket_messages": websocket_messages,
         "health_after": health_after,
         "asset_snapshot_after": asset_snapshot,
@@ -129,7 +165,7 @@ def main() -> int:
         ],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
-    return 0 if response.json().get("success") else 1
+    return 0 if response_body.get("success") else 1
 
 
 if __name__ == "__main__":

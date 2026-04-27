@@ -4,14 +4,44 @@ from asset_lifecycle import validate_asset_transition
 from models import (
     ActionType,
     ConfirmResult,
+    DEFAULT_MAX_BORROW_DAYS,
     DeviceStatus,
     InboundRuleCheckRequest,
+    RoleType,
     RuleCheckRequest,
     RuleCheckResult,
 )
 
 
 class RuleService:
+    def resolve_user_role(self, user_id: str, *, admin_user_ids: set[str]) -> RoleType:
+        normalized = user_id.strip()
+        if normalized and normalized in admin_user_ids:
+            return RoleType.ADMIN
+        return RoleType.BORROWER
+
+    def validate_requested_days(
+        self,
+        *,
+        request: RuleCheckRequest,
+        requested_days: int,
+        max_borrow_days: int = DEFAULT_MAX_BORROW_DAYS,
+    ) -> RuleCheckResult:
+        if requested_days <= 0:
+            return self._failed(
+                request=request,
+                code=ConfirmResult.PARAM_INVALID.value,
+                message="requested_days must be positive",
+            )
+        if requested_days > max_borrow_days:
+            return self._failed(
+                request=request,
+                code=ConfirmResult.PARAM_INVALID.value,
+                message=f"requested_days cannot exceed MAX_BORROW_DAYS ({max_borrow_days})",
+                extra={"max_borrow_days": max_borrow_days, "requested_days": requested_days},
+            )
+        return self._passed(request)
+
     def check_request(self, request: RuleCheckRequest | InboundRuleCheckRequest) -> RuleCheckResult:
         action_check = self.check_action_type(request)
         if action_check is not None:

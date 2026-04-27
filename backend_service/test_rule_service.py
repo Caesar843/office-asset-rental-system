@@ -6,8 +6,10 @@ from models import (
     ActionType,
     AssetStatus,
     ConfirmResult,
+    DEFAULT_MAX_BORROW_DAYS,
     DeviceStatus,
     InboundRuleCheckRequest,
+    RoleType,
     RuleCheckRequest,
 )
 from rule_service import RuleService
@@ -168,6 +170,46 @@ class RuleServiceTests(unittest.TestCase):
 
         self.assertFalse(result.passed)
         self.assertEqual(result.code, ConfirmResult.PARAM_INVALID.value)
+
+    def test_resolve_user_role_distinguishes_admin_and_borrower(self) -> None:
+        admin_ids = {"ADMIN", "U-ADMIN"}
+
+        self.assertEqual(
+            self.rule_service.resolve_user_role("U-ADMIN", admin_user_ids=admin_ids),
+            RoleType.ADMIN,
+        )
+        self.assertEqual(
+            self.rule_service.resolve_user_role("U-1001", admin_user_ids=admin_ids),
+            RoleType.BORROWER,
+        )
+
+    def test_validate_requested_days_passes_within_max(self) -> None:
+        result = self.rule_service.validate_requested_days(
+            request=self.build_request(action_type=ActionType.BORROW, asset_status=AssetStatus.IN_STOCK),
+            requested_days=DEFAULT_MAX_BORROW_DAYS,
+            max_borrow_days=DEFAULT_MAX_BORROW_DAYS,
+        )
+
+        self.assertTrue(result.passed)
+        self.assertEqual(result.code, ConfirmResult.CONFIRMED.value)
+
+    def test_validate_requested_days_rejects_invalid_or_exceeded_value(self) -> None:
+        zero_days = self.rule_service.validate_requested_days(
+            request=self.build_request(action_type=ActionType.BORROW, asset_status=AssetStatus.IN_STOCK),
+            requested_days=0,
+            max_borrow_days=DEFAULT_MAX_BORROW_DAYS,
+        )
+        exceeded_days = self.rule_service.validate_requested_days(
+            request=self.build_request(action_type=ActionType.BORROW, asset_status=AssetStatus.IN_STOCK),
+            requested_days=DEFAULT_MAX_BORROW_DAYS + 1,
+            max_borrow_days=DEFAULT_MAX_BORROW_DAYS,
+        )
+
+        self.assertFalse(zero_days.passed)
+        self.assertEqual(zero_days.code, ConfirmResult.PARAM_INVALID.value)
+        self.assertFalse(exceeded_days.passed)
+        self.assertEqual(exceeded_days.code, ConfirmResult.PARAM_INVALID.value)
+        self.assertEqual(exceeded_days.extra["max_borrow_days"], DEFAULT_MAX_BORROW_DAYS)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,8 @@ from api_schemas import (
     HealthResponse,
     InboundRequestBody,
     BorrowRequestRecordResponse,
+    ReturnAcceptanceActionResponse,
+    ReturnAcceptanceCreateBody,
     ReturnRequestBody,
     ScanResultRequestBody,
     ScanResultResponse,
@@ -38,6 +40,7 @@ from api_schemas import (
 )
 from db_repository import MySQLTransactionRepository, RepositoryProbeResult, SQLiteTransactionRepository
 from models import (
+    AcceptanceResult,
     ActionType,
     AssetStatus,
     BorrowApprovalCommand,
@@ -48,6 +51,7 @@ from models import (
     DeviceStatus,
     InboundCommand,
     ReturnCommand,
+    ReturnAcceptanceCreateCommand,
 )
 from repository import InMemoryTransactionRepository, TransactionRepository
 from serial_manager import SerialManager
@@ -545,6 +549,32 @@ def _selection_from_probe(
     )
 
 
+def _mysql_unavailable_selection(startup_error: str) -> RepositorySelection:
+    repository = InMemoryTransactionRepository(initial_assets=_load_initial_assets_from_env())
+    details = {
+        "backend": "inmemory",
+        "ready": False,
+        "status": "error",
+        "warnings": [],
+        "errors": [startup_error],
+        "details": {
+            "requested_mode": "mysql",
+            "fallback_target": "inmemory",
+            "write_blocked": True,
+        },
+    }
+    return RepositorySelection(
+        repository=repository,
+        requested_mode="mysql",
+        active_mode="inmemory",
+        fallback_used=True,
+        ready=False,
+        status="error",
+        details=details,
+        startup_error=startup_error,
+    )
+
+
 def _fallback_to_inmemory(*, requested_mode: str, startup_error: str) -> RepositorySelection:
     repository = InMemoryTransactionRepository(initial_assets=_load_initial_assets_from_env())
     details = _inmemory_probe_details(requested_mode=requested_mode, startup_error=startup_error)
@@ -597,14 +627,21 @@ def _build_repository_from_env() -> RepositorySelection:
             repository = MySQLTransactionRepository.from_env()
             probe = repository.probe()
         except Exception as exc:
-            warning = f"mysql repository unavailable, fallback to in-memory: {exc}"
+            warning = f"mysql repository unavailable: {exc}"
             LOGGER.exception(warning)
-            return _fallback_to_inmemory(requested_mode="mysql", startup_error=warning)
+            return _mysql_unavailable_selection(startup_error=warning)
 
         if not probe.ready:
-            warning = f"mysql repository probe failed, fallback to in-memory: {probe.errors}"
+            warning = f"mysql repository probe failed: {probe.errors}"
             LOGGER.warning(warning)
-            return _fallback_to_inmemory(requested_mode="mysql", startup_error=warning)
+            return _selection_from_probe(
+                repository=repository,
+                requested_mode="mysql",
+                active_mode="mysql",
+                fallback_used=False,
+                probe=probe,
+                startup_error=warning,
+            )
 
         if probe.status == "warning":
             LOGGER.warning("api runtime using mysql repository with warnings: %s", probe.warnings)
@@ -755,6 +792,28 @@ def _normalize_dashboard_time_range(raw_time_range: str | None) -> str:
     return normalized if normalized in DASHBOARD_TIME_RANGES else "all"
 
 
+def _formal_mysql_write_block_reason(runtime: ApiRuntime) -> str | None:
+    if runtime.requested_repository_mode.strip().lower() != "mysql":
+        return None
+    if runtime.repository_mode == "mysql" and runtime.repository_ready and not runtime.repository_fallback:
+        return None
+    startup_error = runtime.startup_error or "requested mysql repository is not available"
+    return (
+        "requested mysql repository is not ready for formal writes: "
+        f"repository_mode={runtime.repository_mode}, "
+        f"repository_ready={runtime.repository_ready}, "
+        f"repository_status={runtime.repository_status}, "
+        f"repository_fallback={runtime.repository_fallback}; "
+        f"{startup_error}"
+    )
+
+
+def _ensure_formal_mysql_write_ready(runtime: ApiRuntime) -> None:
+    blocked_reason = _formal_mysql_write_block_reason(runtime)
+    if blocked_reason is not None:
+        raise HTTPException(status_code=503, detail=blocked_reason)
+
+
 def _parse_operation_time(raw_operation_time: Any) -> datetime | None:
     if raw_operation_time is None:
         return None
@@ -863,6 +922,11 @@ def _build_dashboard_payload(
         {"asset_id": asset_id, "count": count}
         for asset_id, count in sorted(borrow_top_counter.items(), key=lambda item: (-item[1], item[0]))[:5]
     ]
+    overdue_count = 0
+    for overdue_row in _list_overdue_exception_rows(repository):
+        overdue_time = _parse_operation_time(overdue_row.get("event_time"))
+        if _is_operation_in_time_range(overdue_time, time_range):
+            overdue_count += 1
 
     return {
         "filters": {
@@ -873,6 +937,9 @@ def _build_dashboard_payload(
         "operation_stats": {
             "borrow_count": borrow_count,
             "return_count": return_count,
+        },
+        "exception_stats": {
+            "overdue_count": overdue_count,
         },
         "borrow_top_assets": borrow_top_assets,
         "available_filters": {
@@ -1066,6 +1133,16 @@ def _normalize_borrow_request_status_filter(raw_status: str | None) -> BorrowReq
         return None
 
 
+def _normalize_acceptance_result_filter(raw_result: str | None) -> AcceptanceResult | None:
+    normalized = (raw_result or "").strip().upper()
+    if not normalized:
+        return None
+    try:
+        return AcceptanceResult(normalized)
+    except ValueError:
+        return None
+
+
 def _build_borrow_requests_payload(
     repository: TransactionRepository,
     *,
@@ -1098,6 +1175,62 @@ def _build_borrow_requests_payload(
     }
 
 
+def _build_return_acceptances_payload(
+    repository: TransactionRepository,
+    *,
+    asset_id: str | None,
+    acceptance_result: str | None,
+    accepted_by_user_id: str | None,
+    time_range: str,
+) -> dict[str, Any]:
+    normalized_asset_id = (asset_id or "").strip() or None
+    normalized_acceptance_result = _normalize_acceptance_result_filter(acceptance_result)
+    normalized_accepted_by_user_id = (accepted_by_user_id or "").strip() or None
+    normalized_time_range = _normalize_dashboard_time_range(time_range)
+
+    items: list[dict[str, Any]] = []
+    for record in repository.list_return_acceptances(
+        asset_id=normalized_asset_id,
+        acceptance_result=normalized_acceptance_result,
+        accepted_by_user_id=normalized_accepted_by_user_id,
+    ):
+        accepted_at_dt = _parse_operation_time(record.accepted_at)
+        if not _is_operation_in_time_range(accepted_at_dt, normalized_time_range):
+            continue
+
+        items.append(
+            {
+                "id": record.id,
+                "asset_id": record.asset_id,
+                "acceptance_result": record.acceptance_result.value,
+                "note": record.note,
+                "accepted_by_user_id": record.accepted_by_user_id,
+                "accepted_by_user_name": record.accepted_by_user_name,
+                "accepted_at": _stringify_export_value(accepted_at_dt or record.accepted_at),
+                "related_return_request_seq": record.related_return_request_seq,
+                "related_return_request_id": record.related_return_request_id,
+                "related_return_hw_seq": record.related_return_hw_seq,
+            }
+        )
+
+    return {
+        "filters": {
+            "asset_id": normalized_asset_id,
+            "acceptance_result": None
+            if normalized_acceptance_result is None
+            else normalized_acceptance_result.value,
+            "accepted_by_user_id": normalized_accepted_by_user_id,
+            "time_range": normalized_time_range,
+        },
+        "items": items,
+        "total": len(items),
+        "available_filters": {
+            "acceptance_results": [result.value for result in AcceptanceResult],
+            "time_ranges": list(DASHBOARD_TIME_RANGES),
+        },
+    }
+
+
 def _list_operation_trace_rows(repository: TransactionRepository) -> list[dict[str, Any]]:
     if isinstance(repository, InMemoryTransactionRepository):
         return [
@@ -1107,6 +1240,8 @@ def _list_operation_trace_rows(repository: TransactionRepository) -> list[dict[s
                 "user_id": record.user_id,
                 "user_name": record.user_name,
                 "op_time": getattr(record, "op_time", None),
+                "due_time": getattr(record, "due_time", None),
+                "request_seq": getattr(record, "request_seq", None),
                 "hw_seq": record.hw_seq,
                 "hw_result": record.hw_result,
                 "hw_sn": record.hw_sn,
@@ -1142,6 +1277,8 @@ def _list_operation_trace_rows(repository: TransactionRepository) -> list[dict[s
                 "user_id": user_id_map.get(row.get("user_id"), row.get("user_id") or ""),
                 "user_name": user_name_map.get(row.get("user_id"), ""),
                 "op_time": row.get("op_time"),
+                "due_time": row.get("due_time"),
+                "request_seq": row.get("request_seq"),
                 "hw_seq": row.get("hw_seq"),
                 "hw_result": row.get("hw_result"),
                 "hw_sn": row.get("hw_sn"),
@@ -1255,7 +1392,55 @@ def _build_asset_changes_payload(
     }
 
 
+OVERDUE_EXCEPTION_CODE = "OVERDUE"
+OVERDUE_EXCEPTION_MESSAGE = "borrow due_time exceeded"
+
+
+def _list_overdue_exception_rows(repository: TransactionRepository) -> list[dict[str, Any]]:
+    asset_status_map = _list_asset_status_map(repository)
+    latest_records_by_asset: dict[str, dict[str, Any]] = {}
+    for row in _list_operation_trace_rows(repository):
+        asset_id = str(row.get("asset_id") or "")
+        if not asset_id or asset_id in latest_records_by_asset:
+            continue
+        latest_records_by_asset[asset_id] = row
+
+    overdue_rows: list[dict[str, Any]] = []
+    for asset_id, row in latest_records_by_asset.items():
+        if asset_status_map.get(asset_id) != AssetStatus.BORROWED.value:
+            continue
+        if str(row.get("action_type") or "") != ActionType.BORROW.value:
+            continue
+
+        due_time = _parse_operation_time(row.get("due_time"))
+        if due_time is None:
+            continue
+
+        reference_now = datetime.now(due_time.tzinfo) if due_time.tzinfo is not None else datetime.now()
+        if due_time >= reference_now:
+            continue
+
+        overdue_rows.append(
+            {
+                "asset_id": asset_id,
+                "action_type": ActionType.BORROW.value,
+                "user_id": row.get("user_id") or "",
+                "user_name": row.get("user_name") or "",
+                "code": OVERDUE_EXCEPTION_CODE,
+                "message": OVERDUE_EXCEPTION_MESSAGE,
+                "event_time": _stringify_export_value(due_time),
+                "request_seq": row.get("request_seq"),
+                "hw_seq": row.get("hw_seq"),
+                "hw_result": row.get("hw_result"),
+            }
+        )
+
+    overdue_rows.sort(key=lambda row: _stringify_export_value(row.get("event_time")), reverse=True)
+    return overdue_rows
+
+
 EXCEPTION_RECORD_CODES = (
+    OVERDUE_EXCEPTION_CODE,
     ConfirmResult.DEVICE_OFFLINE.value,
     ConfirmResult.ASSET_NOT_FOUND.value,
     ConfirmResult.STATE_INVALID.value,
@@ -1324,6 +1509,8 @@ def _build_exceptions_payload(
 
     with runtime.exception_records_lock:
         exception_rows = list(reversed(runtime.exception_records))
+    exception_rows.extend(_list_overdue_exception_rows(runtime.repository))
+    exception_rows.sort(key=lambda row: _stringify_export_value(row.get("event_time")), reverse=True)
 
     items: list[dict[str, Any]] = []
     for row in exception_rows:
@@ -1526,6 +1713,40 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
             LOGGER.exception("failed to export records csv")
             raise HTTPException(status_code=500, detail="failed to export records csv") from exc
 
+    @app.get("/export/return-acceptances.csv")
+    def export_return_acceptances_csv(
+        asset_id: str | None = None,
+        acceptance_result: str | None = None,
+        accepted_by_user_id: str | None = None,
+        time_range: str = "all",
+    ) -> Response:
+        try:
+            payload = _build_return_acceptances_payload(
+                runtime.repository,
+                asset_id=asset_id,
+                acceptance_result=acceptance_result,
+                accepted_by_user_id=accepted_by_user_id,
+                time_range=time_range,
+            )
+            return _csv_download_response(
+                rows=payload["items"],
+                fieldnames=[
+                    "asset_id",
+                    "acceptance_result",
+                    "note",
+                    "accepted_by_user_id",
+                    "accepted_by_user_name",
+                    "accepted_at",
+                    "related_return_request_seq",
+                    "related_return_request_id",
+                    "related_return_hw_seq",
+                ],
+                filename="return_acceptances_export.csv",
+            )
+        except Exception as exc:
+            LOGGER.exception("failed to export return acceptances csv")
+            raise HTTPException(status_code=500, detail="failed to export return acceptances csv") from exc
+
     @app.get("/export/exceptions.csv")
     def export_exceptions_csv(
         asset_id: str | None = None,
@@ -1587,12 +1808,14 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/borrow-requests", response_model=BorrowRequestActionResponse)
     def create_borrow_request(body: BorrowRequestCreateBody) -> BorrowRequestActionResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         try:
             command = BorrowRequestCreateCommand(
                 asset_id=body.asset_id,
                 user_id=body.user_id,
                 user_name=body.user_name,
                 reason=body.reason,
+                requested_days=body.requested_days,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1619,6 +1842,7 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/borrow-requests/{request_id}/approve", response_model=BorrowRequestActionResponse)
     def approve_borrow_request(request_id: str, body: BorrowRequestReviewBody) -> BorrowRequestActionResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         try:
             command = BorrowApprovalCommand(
                 request_id=request_id,
@@ -1635,6 +1859,7 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/borrow-requests/{request_id}/reject", response_model=BorrowRequestActionResponse)
     def reject_borrow_request(request_id: str, body: BorrowRequestReviewBody) -> BorrowRequestActionResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         try:
             command = BorrowApprovalCommand(
                 request_id=request_id,
@@ -1651,13 +1876,51 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/borrow-requests/{request_id}/start-borrow", response_model=BusinessResultResponse)
     def start_borrow_from_request(request_id: str, body: BorrowRequestStartBorrowBody) -> BusinessResultResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         result = runtime.service.start_borrow_from_request(request_id, timeout_ms=body.timeout_ms)
         result_payload = result.to_dict()
         _record_runtime_exception(runtime, result_payload=result_payload)
         return BusinessResultResponse.model_validate(result_payload)
 
+    @app.post("/return-acceptances", response_model=ReturnAcceptanceActionResponse)
+    def create_return_acceptance(body: ReturnAcceptanceCreateBody) -> ReturnAcceptanceActionResponse:
+        _ensure_formal_mysql_write_ready(runtime)
+        try:
+            command = ReturnAcceptanceCreateCommand(
+                asset_id=body.asset_id,
+                accepted_by_user_id=body.accepted_by_user_id,
+                accepted_by_user_name=body.accepted_by_user_name,
+                acceptance_result=body.acceptance_result,
+                note=body.note,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        result = runtime.service.create_return_acceptance(command)
+        return ReturnAcceptanceActionResponse.model_validate(result.to_dict())
+
+    @app.get("/return-acceptances")
+    def list_return_acceptances(
+        asset_id: str | None = None,
+        acceptance_result: str | None = None,
+        accepted_by_user_id: str | None = None,
+        time_range: str = "all",
+    ) -> dict[str, Any]:
+        try:
+            return _build_return_acceptances_payload(
+                runtime.repository,
+                asset_id=asset_id,
+                acceptance_result=acceptance_result,
+                accepted_by_user_id=accepted_by_user_id,
+                time_range=time_range,
+            )
+        except Exception as exc:
+            LOGGER.exception("failed to build return acceptances payload")
+            raise HTTPException(status_code=500, detail="failed to build return acceptances payload") from exc
+
     @app.post("/transactions/borrow", response_model=BusinessResultResponse)
     def post_borrow(body: BorrowRequestBody) -> BusinessResultResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         try:
             command = BorrowCommand(
                 asset_id=body.asset_id,
@@ -1675,6 +1938,7 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/transactions/return", response_model=BusinessResultResponse)
     def post_return(body: ReturnRequestBody) -> BusinessResultResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         try:
             command = ReturnCommand(
                 asset_id=body.asset_id,
@@ -1692,6 +1956,7 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/transactions/inbound", response_model=BusinessResultResponse)
     def post_inbound(body: InboundRequestBody) -> BusinessResultResponse:
+        _ensure_formal_mysql_write_ready(runtime)
         try:
             command = InboundCommand(
                 asset_id=body.asset_id,
