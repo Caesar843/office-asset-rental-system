@@ -257,6 +257,10 @@
             font-size: 18px;
         }
 
+        #inbound-latest-scan-panel {
+            margin-bottom: 25px;
+        }
+
         .dashboard-value {
             font-size: 30px;
             font-weight: bold;
@@ -512,6 +516,14 @@
             <!-- 入库操作 -->
             <div id="inbound" class="tab-content">
                 <div id="inbound-scan-status" class="status info">待填写：可先在“扫码识别”页带入资产ID，也可直接手工录入。</div>
+                <div class="dashboard-panel" id="inbound-latest-scan-panel">
+                    <h3>最近扫码结果</h3>
+                    <div id="inbound-latest-scan-detail" class="status info">尚未读取最近扫码结果。</div>
+                    <div class="dashboard-actions">
+                        <button type="button" onclick="loadLatestScanResult(false)">刷新最近扫码</button>
+                        <button type="button" onclick="useLatestScanResult()">使用最近扫码结果</button>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label for="inbound-asset-id">资产ID</label>
                     <input type="text" id="inbound-asset-id" placeholder="例如: AS-2001">
@@ -719,6 +731,7 @@
         let ws = null;
         let activeTabId = 'borrow';
         let lastScanBinding = null;
+        let latestScanResult = null;
         let activeInboundContext = null;
         let activeBorrowApprovalContext = null;
         let inboundRefreshPromise = null;
@@ -1022,6 +1035,7 @@
             }
 
             if (tabId === 'inbound') {
+                loadLatestScanResult(true);
                 updateInboundFormState();
             }
         }
@@ -1140,7 +1154,86 @@
             document.getElementById('inbound-submit-button').disabled = disabled;
         }
 
-        function bindScanResultToInbound(result, rawText) {
+        function getScanField(result, fieldName, fallback = null) {
+            if (result && typeof result[fieldName] === 'string' && result[fieldName].trim()) {
+                return result[fieldName].trim();
+            }
+            if (result && result.extra && typeof result.extra[fieldName] === 'string' && result.extra[fieldName].trim()) {
+                return result.extra[fieldName].trim();
+            }
+            return fallback;
+        }
+
+        function getScanRawText(result, fallback) {
+            return getScanField(result, 'raw_text', fallback);
+        }
+
+        function renderLatestScanResult(result) {
+            const detailElement = document.getElementById('inbound-latest-scan-detail');
+            if (!detailElement) {
+                return;
+            }
+
+            if (!result || !result.asset_id) {
+                setStatusText('inbound-latest-scan-detail', '暂无扫码结果。', 'info');
+                return;
+            }
+
+            const exists = result.extra && result.extra.exists === true;
+            const parts = [
+                `资产ID：${result.asset_id}`,
+                `原始内容：${result.raw_text || result.asset_id}`,
+                `码制：${result.symbology || '-'}`,
+                `来源：${result.source_id || '-'}`,
+                `帧时间：${result.frame_time || '-'}`,
+                `接收时间：${result.received_at || '-'}`,
+                `资产状态：${exists ? (result.extra.asset_status || '已建档') : '未建档'}`,
+            ];
+            setStatusText('inbound-latest-scan-detail', parts.join('；'), exists ? 'info' : 'success');
+        }
+
+        async function loadLatestScanResult(autoFill) {
+            setStatusText('inbound-latest-scan-detail', '正在读取最近扫码结果...', 'info');
+            try {
+                const response = await fetch(`${API_BASE_URL}/scan/latest`);
+                const result = await response.json();
+                if (!response.ok) {
+                    const message = result.message || result.detail || '读取最近扫码结果失败';
+                    setStatusText('inbound-latest-scan-detail', message, 'error');
+                    return null;
+                }
+
+                if (!result.success && !result.asset_id) {
+                    latestScanResult = null;
+                    renderLatestScanResult(null);
+                    return null;
+                }
+
+                latestScanResult = result;
+                renderLatestScanResult(result);
+
+                const currentAssetId = document.getElementById('inbound-asset-id').value.trim();
+                if (autoFill && !currentAssetId && result.asset_id) {
+                    bindScanResultToInbound(result, getScanRawText(result, result.asset_id), false);
+                }
+
+                return result;
+            } catch (error) {
+                setStatusText('inbound-latest-scan-detail', `请求错误：${error.message}`, 'error');
+                return null;
+            }
+        }
+
+        async function useLatestScanResult() {
+            const result = latestScanResult || await loadLatestScanResult(false);
+            if (!result || !result.asset_id) {
+                setStatusText('inbound-scan-status', '暂无可用的最近扫码结果。', 'error');
+                return;
+            }
+            bindScanResultToInbound(result, getScanRawText(result, result.asset_id), false);
+        }
+
+        function bindScanResultToInbound(result, rawText, switchToInbound = true) {
             const assetId = (result.asset_id || '').trim();
             if (!assetId) {
                 return;
@@ -1149,8 +1242,11 @@
             document.getElementById('inbound-asset-id').value = assetId;
             lastScanBinding = {
                 assetId: assetId,
-                rawText: rawText,
-                symbology: null,
+                rawText: rawText || getScanRawText(result, assetId),
+                symbology: getScanField(result, 'symbology', null),
+                sourceId: getScanField(result, 'source_id', null),
+                frameTime: result.frame_time || null,
+                receivedAt: result.received_at || null,
                 code: result.code || '',
                 exists: Boolean(result.extra && result.extra.exists),
                 assetStatus: result.extra && result.extra.asset_status ? result.extra.asset_status : null,
@@ -1171,7 +1267,9 @@
             }
 
             updateInboundFormState();
-            setActiveTab('inbound');
+            if (switchToInbound) {
+                setActiveTab('inbound');
+            }
         }
 
         function resolveStatusTone(payload) {
@@ -2358,7 +2456,11 @@
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        asset_id: scanResult
+                        asset_id: scanResult,
+                        raw_text: scanResult,
+                        symbology: 'MANUAL',
+                        source_id: 'frontend-scan-tab',
+                        frame_time: Math.floor(Date.now() / 1000)
                     })
                 });
 

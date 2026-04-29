@@ -14,6 +14,13 @@ def _strip_required_text(value: str) -> str:
     return stripped
 
 
+def _strip_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 class BorrowRequestBody(BaseModel):
     asset_id: str = Field(..., description="Asset ID")
     user_id: str = Field(..., description="User ID")
@@ -93,11 +100,20 @@ class ReturnAcceptanceCreateBody(BaseModel):
 
 class ScanResultRequestBody(BaseModel):
     asset_id: str = Field(..., description="Asset ID from the scan result")
+    raw_text: str | None = Field(None, description="Original scan text")
+    symbology: str | None = Field(None, description="Scan code format")
+    source_id: str | None = Field(None, description="Vision source identifier")
+    frame_time: int | None = Field(None, gt=0, description="Vision frame Unix timestamp in seconds")
 
     @field_validator("asset_id")
     @classmethod
     def _validate_asset_id(cls, value: str) -> str:
         return _strip_required_text(value)
+
+    @field_validator("raw_text", "symbology", "source_id")
+    @classmethod
+    def _validate_optional_text(cls, value: str | None) -> str | None:
+        return _strip_optional_text(value)
 
 
 class BusinessResultResponse(BaseModel):
@@ -175,6 +191,19 @@ class ScanResultResponse(BaseModel):
     code: str
     message: str
     asset_id: str | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScanLatestResponse(BaseModel):
+    success: bool
+    code: str
+    message: str
+    asset_id: str | None = None
+    raw_text: str | None = None
+    symbology: str | None = None
+    source_id: str | None = None
+    frame_time: int | None = None
+    received_at: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
 

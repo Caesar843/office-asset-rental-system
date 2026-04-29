@@ -513,6 +513,50 @@ class ApiAppTests(unittest.TestCase):
         )
         self.assertFalse(missing_response.json()["exists"])
 
+    def test_scan_latest_empty_and_missing_asset_scan_are_readable_for_inbound_prefill(self) -> None:
+        runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            empty_response = client.get("/scan/latest")
+            scan_response = client.post(
+                "/scan/result",
+                json={
+                    "asset_id": "AS-9020",
+                    "raw_text": "AS-9020",
+                    "symbology": "QR",
+                    "source_id": "webcam-0",
+                    "frame_time": 1700009020,
+                },
+            )
+            latest_response = client.get("/scan/latest")
+            assets_response = client.get("/assets")
+            records_response = client.get("/records?action_type=INBOUND&time_range=all")
+
+        self.assertEqual(empty_response.status_code, 200)
+        self.assertEqual(empty_response.json()["code"], "NO_SCAN_RESULT")
+        self.assertFalse(empty_response.json()["success"])
+
+        self.assertEqual(scan_response.status_code, 200)
+        self.assertEqual(scan_response.json()["code"], "ASSET_NOT_FOUND")
+        self.assertFalse(scan_response.json()["success"])
+
+        self.assertEqual(latest_response.status_code, 200)
+        latest_payload = latest_response.json()
+        self.assertTrue(latest_payload["success"])
+        self.assertEqual(latest_payload["code"], "SCAN_RESULT_AVAILABLE")
+        self.assertEqual(latest_payload["asset_id"], "AS-9020")
+        self.assertEqual(latest_payload["raw_text"], "AS-9020")
+        self.assertEqual(latest_payload["symbology"], "QR")
+        self.assertEqual(latest_payload["source_id"], "webcam-0")
+        self.assertEqual(latest_payload["frame_time"], 1700009020)
+        self.assertTrue(latest_payload["received_at"])
+        self.assertEqual(latest_payload["extra"]["exists"], False)
+        self.assertEqual(latest_payload["extra"]["scan_code"], "ASSET_NOT_FOUND")
+
+        self.assertNotIn("AS-9020", assets_response.json())
+        self.assertEqual(records_response.json()["total"], 0)
+
     def test_get_assets_returns_frontend_asset_status_map(self) -> None:
         runtime = self.build_runtime(
             serial_manager=FakeSerialManager(),
@@ -550,7 +594,11 @@ class ApiAppTests(unittest.TestCase):
             'id="inbound-user-id"',
             'id="inbound-user-name"',
             'id="inbound-scan-status"',
+            'id="inbound-latest-scan-detail"',
             'onclick="submitInbound()"',
+            'loadLatestScanResult',
+            'useLatestScanResult',
+            '/scan/latest',
             'bindScanResultToInbound',
             'refreshInboundRelatedViews',
         ):
@@ -2608,6 +2656,67 @@ class ApiAppTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["code"], ConfirmResult.CONFIRMED.value)
         self.assertEqual(payload["transaction_state"], "COMPLETED")
+
+    def test_scan_latest_prefill_value_can_inbound_with_mock_mcu_confirmed(self) -> None:
+        mock_server = MockMCUServer(host="127.0.0.1", port=9303, mode="confirmed", confirm_delay=0.05)
+        mock_server.start()
+        time.sleep(0.2)
+        runtime = self.build_runtime(
+            serial_manager=SerialManager(port="socket://127.0.0.1:9303", ack_timeout=0.1, max_retries=3),
+            initial_assets={},
+        )
+        app = create_app(runtime)
+
+        try:
+            with TestClient(app) as client:
+                scan_response = client.post(
+                    "/scan/result",
+                    json={
+                        "asset_id": "AS-9020",
+                        "raw_text": "AS-9020",
+                        "symbology": "QR",
+                        "source_id": "webcam-0",
+                        "frame_time": 1700009020,
+                    },
+                )
+                latest_payload = client.get("/scan/latest").json()
+                inbound_response = client.post(
+                    "/transactions/inbound",
+                    json={
+                        "asset_id": latest_payload["asset_id"],
+                        "user_id": "U-ADMIN",
+                        "user_name": "管理员",
+                        "asset_name": "扫码入库资产",
+                        "category_id": 1,
+                        "location": "Cabinet Z",
+                        "raw_text": latest_payload["raw_text"],
+                        "symbology": latest_payload["symbology"],
+                        "timeout_ms": 300,
+                    },
+                )
+                assets_payload = client.get("/assets").json()
+                records_payload = client.get("/records?action_type=INBOUND&asset_id=AS-9020&time_range=all").json()
+                asset_changes_payload = client.get(
+                    "/asset-changes?action_type=INBOUND&asset_id=AS-9020&time_range=all"
+                ).json()
+                dashboard_payload = client.get("/dashboard?time_range=all").json()
+        finally:
+            mock_server.stop()
+
+        self.assertEqual(scan_response.status_code, 200)
+        self.assertEqual(scan_response.json()["code"], "ASSET_NOT_FOUND")
+        self.assertEqual(latest_payload["asset_id"], "AS-9020")
+        self.assertEqual(inbound_response.status_code, 200)
+        inbound_payload = inbound_response.json()
+        self.assertTrue(inbound_payload["success"])
+        self.assertEqual(inbound_payload["code"], ConfirmResult.CONFIRMED.value)
+        self.assertEqual(inbound_payload["hw_result"], ConfirmResult.CONFIRMED.value)
+        self.assertEqual(inbound_payload["transaction_state"], "COMPLETED")
+        self.assertEqual(assets_payload["AS-9020"], AssetStatus.IN_STOCK.value)
+        self.assertEqual(records_payload["total"], 1)
+        self.assertEqual(records_payload["items"][0]["asset_id"], "AS-9020")
+        self.assertEqual(asset_changes_payload["total"], 1)
+        self.assertEqual(dashboard_payload["summary"]["in_stock"], 1)
 
     def test_borrow_api_offline_failure(self) -> None:
         runtime = self.build_runtime(

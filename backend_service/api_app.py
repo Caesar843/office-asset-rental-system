@@ -34,6 +34,7 @@ from api_schemas import (
     ReturnAcceptanceActionResponse,
     ReturnAcceptanceCreateBody,
     ReturnRequestBody,
+    ScanLatestResponse,
     ScanResultRequestBody,
     ScanResultResponse,
     StatusMessageResponse,
@@ -392,6 +393,8 @@ class ApiRuntime:
     startup_error_kind: str | None = None
     exception_records: list[dict[str, Any]] = field(default_factory=list)
     exception_records_lock: Any = field(default_factory=Lock)
+    latest_scan_result: dict[str, Any] | None = None
+    latest_scan_result_lock: Any = field(default_factory=Lock)
 
     def add_startup_error(self, message: str) -> None:
         if self.startup_error:
@@ -1494,6 +1497,46 @@ def _record_runtime_exception(
             del runtime.exception_records[:-MAX_RUNTIME_EXCEPTION_RECORDS]
 
 
+def _build_latest_scan_snapshot(
+    runtime: ApiRuntime,
+    body: ScanResultRequestBody,
+    *,
+    exists: bool | None,
+    asset_status: AssetStatus | None,
+    scan_code: str,
+    received_at: str,
+) -> dict[str, Any]:
+    return {
+        "success": True,
+        "code": "SCAN_RESULT_AVAILABLE",
+        "message": "已读取最近扫码结果",
+        "asset_id": body.asset_id,
+        "raw_text": body.raw_text or body.asset_id,
+        "symbology": body.symbology,
+        "source_id": body.source_id,
+        "frame_time": body.frame_time,
+        "received_at": received_at,
+        "extra": {
+            "exists": exists,
+            "asset_status": None if asset_status is None else asset_status.value,
+            "device_status": runtime.service.device_status.value,
+            "scan_code": scan_code,
+        },
+    }
+
+
+def _store_latest_scan_result(runtime: ApiRuntime, snapshot: dict[str, Any]) -> None:
+    with runtime.latest_scan_result_lock:
+        runtime.latest_scan_result = dict(snapshot)
+
+
+def _get_latest_scan_result(runtime: ApiRuntime) -> dict[str, Any] | None:
+    with runtime.latest_scan_result_lock:
+        if runtime.latest_scan_result is None:
+            return None
+        return dict(runtime.latest_scan_result)
+
+
 def _build_exceptions_payload(
     runtime: ApiRuntime,
     *,
@@ -1999,9 +2042,32 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
 
     @app.post("/scan/result", response_model=ScanResultResponse)
     def post_scan_result(body: ScanResultRequestBody) -> ScanResultResponse:
+        received_at = datetime.now().isoformat(sep=" ", timespec="seconds")
+        _store_latest_scan_result(
+            runtime,
+            _build_latest_scan_snapshot(
+                runtime,
+                body,
+                exists=None,
+                asset_status=None,
+                scan_code="SCAN_RECEIVED",
+                received_at=received_at,
+            ),
+        )
         try:
             asset_status = runtime.service.get_asset_status(body.asset_id)
             exists = asset_status is not None
+            _store_latest_scan_result(
+                runtime,
+                _build_latest_scan_snapshot(
+                    runtime,
+                    body,
+                    exists=exists,
+                    asset_status=asset_status,
+                    scan_code="SCAN_ACCEPTED" if exists else "ASSET_NOT_FOUND",
+                    received_at=received_at,
+                ),
+            )
             return ScanResultResponse(
                 success=exists,
                 code="SCAN_ACCEPTED" if exists else "ASSET_NOT_FOUND",
@@ -2022,6 +2088,24 @@ def create_app(runtime: ApiRuntime | None = None) -> FastAPI:
                 asset_id=body.asset_id,
                 extra={},
             )
+
+    @app.get("/scan/latest", response_model=ScanLatestResponse)
+    def get_latest_scan_result() -> ScanLatestResponse:
+        latest_scan = _get_latest_scan_result(runtime)
+        if latest_scan is None:
+            return ScanLatestResponse(
+                success=False,
+                code="NO_SCAN_RESULT",
+                message="暂无扫码结果",
+                asset_id=None,
+                raw_text=None,
+                symbology=None,
+                source_id=None,
+                frame_time=None,
+                received_at=None,
+                extra={},
+            )
+        return ScanLatestResponse.model_validate(latest_scan)
 
     @app.websocket("/ws/status")
     async def websocket_status(websocket: WebSocket) -> None:
