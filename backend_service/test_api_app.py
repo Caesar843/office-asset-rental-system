@@ -628,6 +628,7 @@ class ApiAppTests(unittest.TestCase):
             '<strong>借用天数:</strong>',
         ):
             self.assertIn(snippet, html)
+        self.assertGreaterEqual(html.count("startBorrowFromRequest('${item.request_id}'"), 2)
 
     def test_frontend_home_borrow_request_uses_result_success_and_requested_days_wiring(self) -> None:
         runtime = self.build_runtime(serial_manager=FakeSerialManager(), initial_assets={})
@@ -759,6 +760,7 @@ class ApiAppTests(unittest.TestCase):
                         "review_comment": "approved",
                     },
                 )
+                assets_after_approval_response = client.get("/assets")
                 approved_response = client.get("/borrow-requests?status=APPROVED&applicant_user_id=U-BR-1001")
                 start_response = client.post(
                     f"/borrow-requests/{request_id}/start-borrow",
@@ -778,6 +780,7 @@ class ApiAppTests(unittest.TestCase):
         self.assertEqual(approve_response.status_code, 200)
         self.assertEqual(approve_response.json()["code"], "REQUEST_APPROVED")
         self.assertEqual(approve_response.json()["item"]["status"], "APPROVED")
+        self.assertEqual(assets_after_approval_response.json()["AS-BR-1001"], AssetStatus.IN_STOCK.value)
         self.assertEqual(approved_response.status_code, 200)
         self.assertEqual(approved_response.json()["total"], 1)
         self.assertEqual(approved_response.json()["items"][0]["request_id"], request_id)
@@ -1083,6 +1086,50 @@ class ApiAppTests(unittest.TestCase):
         self.assertEqual(approved_response.json()["total"], 1)
         self.assertEqual(approved_response.json()["items"][0]["status"], "APPROVED")
         self.assertEqual(assets_response.json()["AS-BR-1008"], AssetStatus.IN_STOCK.value)
+        self.assertEqual(len(repository.records), 0)
+
+    def test_borrow_request_api_start_borrow_timeout_does_not_update_asset(self) -> None:
+        repository = InMemoryTransactionRepository(initial_assets={"AS-BR-1009": AssetStatus.IN_STOCK})
+        runtime = self.build_runtime(
+            serial_manager=FakeSerialManager(response_factory=None),
+            repository=repository,
+        )
+        app = create_app(runtime)
+
+        with TestClient(app) as client:
+            create_response = client.post(
+                "/borrow-requests",
+                json={
+                    "asset_id": "AS-BR-1009",
+                    "user_id": "U-BR-1009",
+                    "user_name": "Borrow User",
+                    "reason": "timeout path",
+                },
+            )
+            request_id = create_response.json()["item"]["request_id"]
+            client.post(
+                f"/borrow-requests/{request_id}/approve",
+                json={
+                    "reviewer_user_id": "U-ADMIN",
+                    "reviewer_user_name": "Admin User",
+                    "review_comment": "approved",
+                },
+            )
+            start_response = client.post(
+                f"/borrow-requests/{request_id}/start-borrow",
+                json={"timeout_ms": 1},
+            )
+            approved_response = client.get("/borrow-requests?status=APPROVED&asset_id=AS-BR-1009")
+            assets_response = client.get("/assets")
+
+        self.assertEqual(start_response.status_code, 200)
+        self.assertFalse(start_response.json()["success"])
+        self.assertEqual(start_response.json()["code"], ConfirmResult.HW_RESULT_TIMEOUT.value)
+        self.assertEqual(start_response.json()["extra"]["borrow_request_id"], request_id)
+        self.assertEqual(approved_response.status_code, 200)
+        self.assertEqual(approved_response.json()["total"], 1)
+        self.assertEqual(approved_response.json()["items"][0]["status"], "APPROVED")
+        self.assertEqual(assets_response.json()["AS-BR-1009"], AssetStatus.IN_STOCK.value)
         self.assertEqual(len(repository.records), 0)
 
     def test_borrow_request_api_create_is_blocked_by_pending_transaction(self) -> None:

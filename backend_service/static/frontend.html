@@ -1663,25 +1663,32 @@
                 return;
             }
 
-            list.innerHTML = items.map(item => `
-                <div class="record-item">
-                    <h3>${item.request_id || '-'}</h3>
-                    <div class="record-grid">
-                        <p><strong>资产ID:</strong> ${item.asset_id || '-'}</p>
-                        <p><strong>申请状态:</strong> ${item.status || '-'}</p>
-                        <p><strong>借用人ID:</strong> ${item.applicant_user_id || '-'}</p>
-                        <p><strong>借用人姓名:</strong> ${item.applicant_user_name || '-'}</p>
-                        <p><strong>借用天数:</strong> ${item.requested_days || '-'}</p>
-                        <p><strong>申请理由:</strong> ${item.reason || '-'}</p>
-                        <p><strong>申请时间:</strong> ${item.requested_at || '-'}</p>
-                        <p><strong>审批人ID:</strong> ${item.reviewer_user_id || '-'}</p>
-                        <p><strong>审批人姓名:</strong> ${item.reviewer_user_name || '-'}</p>
-                        <p><strong>审批意见:</strong> ${item.review_comment || '-'}</p>
-                        <p><strong>审批时间:</strong> ${item.reviewed_at || '-'}</p>
-                        <p><strong>消耗时间:</strong> ${item.consumed_at || '-'}</p>
+            list.innerHTML = items.map(item => {
+                const actions = [];
+                if (item.status === 'APPROVED') {
+                    actions.push(`<button type="button" onclick="startBorrowFromRequest('${item.request_id}', '${item.asset_id}', '${item.applicant_user_id}', '${item.applicant_user_name}')">发起借出确认</button>`);
+                }
+                return `
+                    <div class="record-item">
+                        <h3>${item.request_id || '-'}</h3>
+                        <div class="record-grid">
+                            <p><strong>资产ID:</strong> ${item.asset_id || '-'}</p>
+                            <p><strong>申请状态:</strong> ${item.status || '-'}</p>
+                            <p><strong>借用人ID:</strong> ${item.applicant_user_id || '-'}</p>
+                            <p><strong>借用人姓名:</strong> ${item.applicant_user_name || '-'}</p>
+                            <p><strong>借用天数:</strong> ${item.requested_days || '-'}</p>
+                            <p><strong>申请理由:</strong> ${item.reason || '-'}</p>
+                            <p><strong>申请时间:</strong> ${item.requested_at || '-'}</p>
+                            <p><strong>审批人ID:</strong> ${item.reviewer_user_id || '-'}</p>
+                            <p><strong>审批人姓名:</strong> ${item.reviewer_user_name || '-'}</p>
+                            <p><strong>审批意见:</strong> ${item.review_comment || '-'}</p>
+                            <p><strong>审批时间:</strong> ${item.reviewed_at || '-'}</p>
+                            <p><strong>消耗时间:</strong> ${item.consumed_at || '-'}</p>
+                        </div>
+                        ${actions.length ? `<div class="dashboard-actions" style="margin-top: 16px;">${actions.join('')}</div>` : ''}
                     </div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
         }
 
         async function loadBorrowApprovals() {

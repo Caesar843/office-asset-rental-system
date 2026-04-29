@@ -567,7 +567,10 @@ class AssetConfirmService:
                         request_seq=wait_result.pending.request_seq,
                         request_id=wait_result.pending.request_id,
                         state=wait_result.pending.state,
-                        extra={"asset_status": current_status.value},
+                        extra=self._merge_result_extra(
+                            wait_result.pending.extra,
+                            {"asset_status": current_status.value},
+                        ),
                     )
                 )
 
